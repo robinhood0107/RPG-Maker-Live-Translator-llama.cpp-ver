@@ -1864,6 +1864,7 @@
             const JOIN_PAD = 3; // pixels allowed gap/overlap between glyphs
             const FLUSH_DELAY = 50; // ms to wait for more fragments before translating
             const supMap = new WeakMap(); // Bitmap -> Array<{x1,y1,x2,y2,exp}>
+            const fullLineMap = new WeakMap(); // Bitmap -> Map<yKey, { x1, x2, content, exp }>
 
             function yKeyFor(y) { return String(Math.round(Number(y) || 0)); }
 
@@ -1939,6 +1940,45 @@
                     if (!textStr) return original.apply(this, arguments);
 
                     // candidate logging disabled
+
+                    // Track full translated lines we just drew (signed) to suppress substring tails
+                    if (textStr.startsWith(REDRAW_SIGNATURE)) {
+                        const clean = textStr.substring(REDRAW_SIGNATURE.length);
+                        try {
+                            const yKey = yKeyFor(y);
+                            let map = fullLineMap.get(this);
+                            if (!map) { map = new Map(); fullLineMap.set(this, map); }
+                            let w = 0; try { w = Math.ceil(this.measureTextWidth(clean)); } catch (_) { w = (clean.length * ((this.fontSize||24)*0.6))|0; }
+                            const x1 = Number(x)||0;
+                            const x2 = x1 + Math.max(1, w);
+                            map.set(yKey, { x1, x2, content: clean, exp: Date.now() + 300 });
+                        } catch (_) {}
+                        // Proceed to draw clean signed text as usual below (fallthrough handled later)
+                    } else {
+                        // Before drawing any non-signed fragment, suppress if it is a substring of a recent full line on same y
+                        try {
+                            const yKey = yKeyFor(y);
+                            const map = fullLineMap.get(this);
+                            if (map && map.has(yKey)) {
+                                const rec = map.get(yKey);
+                                if (rec && rec.exp > Date.now()) {
+                                    const t = (textStr.trim() || textStr);
+                                    const isSub = rec.content && rec.content.indexOf(t) !== -1;
+                                    if (isSub) {
+                                        // Also ensure x overlap is plausible
+                                        let w = 0; try { w = Math.ceil(this.measureTextWidth(t)); } catch (_) { w = (t.length * ((this.fontSize||24)*0.6))|0; }
+                                        const rx1 = Number(x)||0, rx2 = rx1 + Math.max(1, w);
+                                        const overlaps = !(rx2 < rec.x1 - JOIN_PAD || rx1 > rec.x2 + JOIN_PAD);
+                                        if (overlaps) {
+                                            return; // skip tail fragment
+                                        }
+                                    }
+                                } else if (rec && rec.exp <= Date.now()) {
+                                    map.delete(yKey);
+                                }
+                            }
+                        } catch (_) {}
+                    }
 
                     // Exclude message window contents: let Window_Message pipeline handle it exclusively
                     try {

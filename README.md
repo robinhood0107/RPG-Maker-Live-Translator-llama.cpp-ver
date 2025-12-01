@@ -18,7 +18,7 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 ## Instructions (Installer):
 1. Download all files (excluding .vscode files) and unzip to the game folder.
 2. Create apikey.txt containing your DeepL API key.
-3. Right-click `installer.ps1` → `Run with PowerShell`. If blocked, open up powershell console and `Set-ExecutionPolicy -Scope Process Bypass`. If you're confused, ask ChatGPT to guide you through with executing a `ps1` powershell script.
+3. Run `installer.ps1` - ask ChatGPT for detailed steps if you're confused.
 4. Open up translator.js with your notepad and change `SETTINGS.translation.targetLang` (such as EN).
 
 ## Instructions (Manual):
@@ -34,5 +34,8 @@ Change the endpoint to `api.deepl.com` if you're a paid user.
 2. Put the game inside `experimentation/` folder.
 3. Use included `launch.json` configurations to launch nwjs debugging session.
 4. Open up your vibecodingpromasterTM software of your choice because surely you're not manually debugging this 2000 line jank like what, some kind of a caveman.
+
+## Changelog
+0.2 - Try to mitigate occasional overlapping text draws
 
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)
