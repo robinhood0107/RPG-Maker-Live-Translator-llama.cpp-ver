@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "NWjs (webRoot: experimentation)",
+            "type": "nwjs",
+            "request": "launch",
+            "nwjsVersion": "any",
+            "webRoot": "${workspaceFolder}/experimentation",
+            "reloadAfterAttached": true,
+            "preLaunchTask": "copy-files-and-install"
+        },
+        {
+            "name": "NWjs (webRoot: experimentation/www)",
+            "type": "nwjs",
+            "request": "launch",
+            "nwjsVersion": "any",
+            "webRoot": "${workspaceFolder}/experimentation/www",
+            "reloadAfterAttached": true,
+            "preLaunchTask": "copy-files-and-install"
+        }
+    ]
+}
