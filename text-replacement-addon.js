@@ -1,12 +1,19 @@
 (() => {
     'use strict';
-    console.log('TEXT REPLACEMENT ADDON LOADED');
+    // Preserve original console methods for logging fallbacks
+    const originalConsoleLog = console.log.bind(console);
+    const originalConsoleWarn = console.warn ? console.warn.bind(console) : originalConsoleLog;
+    const originalConsoleError = console.error ? console.error.bind(console) : originalConsoleLog;
 
     // Basic settings and debug gates
     const SETTINGS = {
+        logging: {
+            enabled: false,         // master switch for console/log outputs
+            suppressExact: [
+            ],
+        },
         debug: {
-            log: true,            // high-level logs
-            diagnostics: true,   // verbose diagnostics
+            level: 'trace',       // error, warn, info, debug, trace
         },
         // Experimental features. Disabled by default.
         // NOTE: PIXI text hooks are entirely untested.
@@ -18,17 +25,45 @@
         redraw: {
             extraPadding: 0,      // pixels added around outline (reduced for tighter clears)
             defaultOutline: 0,     // fallback outline width if not found on contents
+        },
+        diskCache: {
+            maxEntries: 0,         // 0 = ~2.1M entries (~3 GiB); override to cap/extend retention
+            clearOnLaunch: false,   // delete stale entries on startup when limit set
         }
     };
 
-    // Back to the original working approach but with throttling to prevent slowdown
-    const originalConsoleLog = console.log.bind(console);
-    
+    // Log level ordering used by the unified logger
+    const LOG_LEVELS = {
+        error: 0,
+        warn: 1,
+        info: 2,
+        debug: 3,
+        trace: 4,
+    };
+
+    const DEFAULT_CACHE_LIMIT = 2_100_000; // ≈3 GiB for typical sentence pairs
+
+    function isLoggingEnabled() {
+        const loggingConfig = SETTINGS && SETTINGS.logging;
+        if (loggingConfig && Object.prototype.hasOwnProperty.call(loggingConfig, 'enabled')) {
+            return !!loggingConfig.enabled;
+        }
+        return true;
+    }
+
     // Throttle logging to prevent the progressive slowdown
     let logThrottle = 0;
-    const maxLogsPerFrame = 5; // Limit logs per animation frame
+    const maxLogsPerFrame = 1000; // Limit logs per animation frame
     
     function forceLog(...args) {
+        if (!isLoggingEnabled()) return;
+        // For local translations, bypass throttling entirely to avoid grouped logs
+        try {
+            if (isLocalProviderConfigured && typeof isLocalProviderConfigured === 'function' && isLocalProviderConfigured()) {
+                try { originalConsoleLog(...args); return; } catch (_) {}
+            }
+        } catch (_) {}
+
         // Reset throttle counter every animation frame
         if (logThrottle === 0) {
             requestAnimationFrame(() => { logThrottle = 0; });
@@ -63,15 +98,114 @@
         return fastTimestamp;
     }
     
-    function dbg(...args) {
-        if (SETTINGS.debug.log) {
-            forceLog('[DBG]', ...args);
+    const logger = (() => {
+        let currentLevel = normalizeLevel(SETTINGS.debug && SETTINGS.debug.level);
+
+        function normalizeLevel(level) {
+            if (typeof level === 'string') {
+                const lower = level.toLowerCase();
+                if (LOG_LEVELS.hasOwnProperty(lower)) {
+                    return lower;
+                }
+            }
+            return 'info';
         }
+
+        function shouldLog(level) {
+            if (!isLoggingEnabled()) return false;
+            const lvl = normalizeLevel(level);
+            return LOG_LEVELS[lvl] <= LOG_LEVELS[currentLevel];
+        }
+
+        function shouldSuppress(level, args) {
+            try {
+                const loggingCfg = SETTINGS && SETTINGS.logging;
+                if (!loggingCfg) return false;
+                const list = loggingCfg.suppressExact;
+                if (!Array.isArray(list) || list.length === 0) return false;
+                const rendered = args.map((arg) => {
+                    if (typeof arg === 'string') return arg;
+                    try { return JSON.stringify(arg); } catch (_) { return String(arg); }
+                }).join(' ');
+                return list.some((entry) => {
+                    if (typeof entry === 'string') {
+                        return entry === rendered;
+                    }
+                    if (entry instanceof RegExp) {
+                        entry.lastIndex = 0;
+                        return entry.test(rendered);
+                    }
+                    if (entry && typeof entry === 'object') {
+                        const { equals, regex } = entry;
+                        if (typeof equals === 'string' && equals === rendered) return true;
+                        if (regex instanceof RegExp) {
+                            regex.lastIndex = 0;
+                            return regex.test(rendered);
+                        }
+                    }
+                    return false;
+                });
+            } catch (_) {
+                return false;
+            }
+        }
+
+        function emit(level, ...args) {
+            if (!isLoggingEnabled()) return;
+            const lvl = normalizeLevel(level);
+            if (shouldSuppress(lvl, args)) return;
+            if (!shouldLog(lvl)) return;
+            switch (lvl) {
+                case 'error':
+                    originalConsoleError(...args);
+                    break;
+                case 'warn':
+                    originalConsoleWarn(...args);
+                    break;
+                default:
+                    forceLog(...args);
+                    break;
+            }
+        }
+
+        function setLevel(level) {
+            currentLevel = normalizeLevel(level);
+            if (SETTINGS && SETTINGS.debug) {
+                SETTINGS.debug.level = currentLevel;
+            }
+            emit('info', `[Logger] Level set to ${currentLevel}`);
+        }
+
+        function getLevel() {
+            return currentLevel;
+        }
+
+        return {
+            emit,
+            error: (...args) => emit('error', ...args),
+            warn: (...args) => emit('warn', ...args),
+            info: (...args) => emit('info', ...args),
+            debug: (...args) => emit('debug', ...args),
+            trace: (...args) => emit('trace', ...args),
+            shouldLog,
+            setLevel,
+            getLevel,
+        };
+    })();
+
+    if (typeof window !== 'undefined') {
+        window.translationLogger = logger;
+    }
+
+    logger.info('TEXT REPLACEMENT ADDON LOADED');
+
+    let _translateSeq = 0; // unique id per translation attempt for log de-grouping
+
+    function dbg(...args) {
+        logger.debug('[DBG]', ...args);
     }
     function diag(...args) {
-        if (SETTINGS.debug.diagnostics) {
-            forceLog('[DIAG]', ...args);
-        }
+        logger.trace('[DIAG]', ...args);
     }
 
     // loudCandidate was used during discovery; now disabled
@@ -164,10 +298,11 @@
         // Log text detection with detailed context
         logTextDetected(source, text, x, y, extraInfo = {}) {
             this.textDetected++;
+            if (!logger.shouldLog('trace')) return;
             const timestamp = getFastTimestamp();
-            forceLog(`[DETECT|${timestamp}] ${source} at (${x},${y}): "${preview(text)}"`, extraInfo.windowType ? `[${extraInfo.windowType}]` : '');
+            logger.trace(`[DETECT|${timestamp}] ${source} at (${x},${y}): "${preview(text)}"${extraInfo.windowType ? ` [${extraInfo.windowType}]` : ''}`);
             if (extraInfo.converted && extraInfo.converted !== text) {
-                forceLog(`  └─ Converted: "${preview(extraInfo.converted)}"`);
+                logger.trace(`  └─ Converted: "${preview(extraInfo.converted)}"`);
             }
         },
 
@@ -177,89 +312,94 @@
             switch (event) {
                 case 'request':
                     this.translationRequests++;
-                    forceLog(`[TRANSLATE|${timestamp}] REQUEST: "${preview(text)}"`);
+                    if (logger.shouldLog('debug')) {
+                        logger.debug(`[TRANSLATE|${timestamp}] REQUEST: "${preview(text)}"`);
+                    }
                     break;
                 case 'cache_hit':
                     this.cacheHits++;
-                    forceLog(`[TRANSLATE|${timestamp}] CACHE HIT: "${preview(text)}" → "${preview(result)}"`);
+                    if (logger.shouldLog('debug')) {
+                        logger.debug(`[TRANSLATE|${timestamp}] CACHE HIT: "${preview(text)}" → "${preview(result)}"`);
+                    }
                     break;
                 case 'cache_miss':
                     this.cacheMisses++;
-                    forceLog(`[TRANSLATE|${timestamp}] CACHE MISS: "${preview(text)}" (starting translation...)`);
+                    if (logger.shouldLog('debug')) {
+                        logger.debug(`[TRANSLATE|${timestamp}] CACHE MISS: "${preview(text)}" (starting translation...)`);
+                    }
                     break;
                 case 'completed':
                     this.textTranslated++;
                     const timeStr = timing ? ` (${timing}ms)` : '';
-                    forceLog(`[TRANSLATE|${timestamp}] COMPLETED${timeStr}: "${preview(text)}" → "${preview(result)}"`);
+                    if (logger.shouldLog('debug')) {
+                        logger.debug(`[TRANSLATE|${timestamp}] COMPLETED${timeStr}: "${preview(text)}" → "${preview(result)}"`);
+                    }
                     break;
                 case 'error':
                     this.errors++;
-                    forceLog(`[TRANSLATE|${timestamp}] ERROR: "${preview(text)}" - ${result}`);
+                    logger.warn(`[TRANSLATE|${timestamp}] ERROR: "${preview(text)}" - ${result}`);
                     break;
                 case 'skip':
-                    forceLog(`[TRANSLATE|${timestamp}] SKIP: "${preview(text)}" - ${result}`);
+                    if (logger.shouldLog('debug')) {
+                        logger.debug(`[TRANSLATE|${timestamp}] SKIP: "${preview(text)}" - ${result}`);
+                    }
                     break;
             }
         },
 
         // Log drawing/redrawing events
         logDraw(event, text, x, y, extraInfo = {}) {
+            if (!logger.shouldLog('trace')) return;
             const timestamp = getFastTimestamp();
             switch (event) {
                 case 'original':
-                    forceLog(`[DRAW|${timestamp}] ORIGINAL at (${x},${y}): "${preview(text)}"`);
+                    logger.trace(`[DRAW|${timestamp}] ORIGINAL at (${x},${y}): "${preview(text)}"`);
                     break;
                 case 'redraw':
                     this.textDrawn++;
-                    forceLog(`[DRAW|${timestamp}] REDRAW at (${x},${y}): "${preview(text)}" [${extraInfo.windowType || 'unknown'}]`);
+                    logger.trace(`[DRAW|${timestamp}] REDRAW at (${x},${y}): "${preview(text)}" [${extraInfo.windowType || 'unknown'}]`);
                     if (extraInfo.clearArea) {
-                        forceLog(`  └─ Clear: (${extraInfo.clearArea.x},${extraInfo.clearArea.y}) ${extraInfo.clearArea.w}×${extraInfo.clearArea.h}`);
+                        logger.trace(`  └─ Clear: (${extraInfo.clearArea.x},${extraInfo.clearArea.y}) ${extraInfo.clearArea.w}×${extraInfo.clearArea.h}`);
                     }
                     break;
                 case 'bypass':
-                    forceLog(`[DRAW|${timestamp}] BYPASS at (${x},${y}): "${preview(text)}" (signature detected)`);
+                    logger.trace(`[DRAW|${timestamp}] BYPASS at (${x},${y}): "${preview(text)}" (signature detected)`);
                     break;
                 case 'queue':
-                    forceLog(`[DRAW|${timestamp}] QUEUED at (${x},${y}): "${preview(text)}" (window not ready)`);
+                    logger.trace(`[DRAW|${timestamp}] QUEUED at (${x},${y}): "${preview(text)}" (window not ready)`);
                     break;
                 case 'skip_same':
-                    forceLog(`[DRAW|${timestamp}] SKIP at (${x},${y}): "${preview(text)}" (identical to original)`);
+                    logger.trace(`[DRAW|${timestamp}] SKIP at (${x},${y}): "${preview(text)}" (identical to original)`);
                     break;
             }
         },
 
         // Show comprehensive stats
         showStats() {
+            if (!logger.shouldLog('debug')) return;
             const runtime = Math.floor((Date.now() - this.startTime) / 1000);
             const cacheTotal = this.cacheHits + this.cacheMisses;
             const hitRate = cacheTotal > 0 ? Math.round((this.cacheHits / cacheTotal) * 100) : 0;
             
-            forceLog('═══ TRANSLATION ADDON STATISTICS ═══');
-            forceLog(`Runtime: ${runtime}s | Detected: ${this.textDetected} | Translated: ${this.textTranslated} | Drawn: ${this.textDrawn}`);
-            forceLog(`Translation Requests: ${this.translationRequests} | Cache Hit Rate: ${hitRate}% (${this.cacheHits}/${cacheTotal})`);
-            forceLog(`Errors: ${this.errors} | Active Windows: ${registeredWindows.size} | Cache Size: ${translationCache.completed.size}`);
+            logger.debug('═══ TRANSLATION ADDON STATISTICS ═══');
+            logger.debug(`Runtime: ${runtime}s | Detected: ${this.textDetected} | Translated: ${this.textTranslated} | Drawn: ${this.textDrawn}`);
+            logger.debug(`Translation Requests: ${this.translationRequests} | Cache Hit Rate: ${hitRate}% (${this.cacheHits}/${cacheTotal})`);
+            logger.debug(`Errors: ${this.errors} | Active Windows: ${registeredWindows.size} | Cache Size: ${translationCache.completed.size}`);
             if (this.errors > 0 || this.textDetected === 0) {
-                forceLog('⚠️  Check for issues if no text detected or high error count');
+                logger.warn('⚠️  Check for issues if no text detected or high error count');
             }
         }
     };
 
     // Test debug functions
-    console.log('Debug settings:', SETTINGS.debug);
-    dbg('DBG function test - this should appear if debug.log is true');
-    diag('DIAG function test - this should appear if debug.diagnostics is true');
-
-    // Periodic stats logging
-    if (SETTINGS.debug.diagnostics) {
-        setInterval(() => {
-            diagnostics.showStats();
-        }, 30000); // Every 30 seconds
-    }
+    logger.debug('Debug settings:', SETTINGS.debug);
+    dbg('DBG function test - this should appear if debug level includes debug');
+    diag('DIAG function test - this should appear if debug level includes trace');
 
     // Make diagnostics globally accessible for manual inspection
     if (typeof window !== 'undefined') {
         window.translationDiagnostics = diagnostics;
-        forceLog('[DIAGNOSTICS] Access stats anytime with: window.translationDiagnostics.showStats()');
+        logger.debug('[DIAGNOSTICS] Access stats anytime with: window.translationDiagnostics.showStats()');
     }
 
     // Helper to create short, single-line previews for logs
@@ -269,21 +409,28 @@
         return s.slice(0, Math.max(0, max - 1)) + '…';
     }
 
-    // Import translator (DeepL helper)
+    // Import translator (DeepL/local helper)
     let textProcessor = null;
+    let _isLocalProvider = null; // lazy-detected based on presence of local.json
+    let _translatorModulePath = null; // resolved path to translator.js when available
     try {
-        textProcessor = (typeof window !== 'undefined' && window.TextProcessor)
-            ? window.TextProcessor
-            : require('./translator.js');
+        if (typeof window !== 'undefined' && window.TextProcessor) {
+            textProcessor = window.TextProcessor;
+        } else {
+            _translatorModulePath = require.resolve('./translator.js');
+            textProcessor = require('./translator.js');
+        }
     } catch (e) {
         // Try alternative paths for translator.js
-        console.log('Translator script not found at ./translator.js, trying alternative paths...');
+        logger.warn('Translator script not found at ./translator.js, trying alternative paths...');
         try {
             // Try relative to game root (for www/js/plugins structure)
+            _translatorModulePath = require.resolve('../../../translator.js');
             textProcessor = require('../../../translator.js');
         } catch (e2) {
             try {
                 // Try relative to js root (for js/plugins structure)
+                _translatorModulePath = require.resolve('../../translator.js');
                 textProcessor = require('../../translator.js');
             } catch (e3) {
                 try {
@@ -293,35 +440,74 @@
                     const cwd = process.cwd();
                     const translatorPath = path.join(cwd, 'translator.js');
                     if (fs.existsSync(translatorPath)) {
+                        _translatorModulePath = translatorPath;
                         textProcessor = require(translatorPath);
                     } else {
                         throw new Error('translator.js not found in any expected location');
                     }
                 } catch (e4) {
-                    console.log('Translator script not found in any expected location. Falling back to no-op translation.');
-                    console.log('Tried paths: ./translator.js, ../../../translator.js, ../../translator.js, and process.cwd()/translator.js');
+                    logger.warn('Translator script not found in any expected location. Falling back to no-op translation.');
+                    logger.warn('Tried paths: ./translator.js, ../../../translator.js, ../../translator.js, and process.cwd()/translator.js');
                 }
             }
         }
     }
 
+    // Best-effort detection of local LLM provider by presence of local.json alongside translator.js
+    function isLocalProviderConfigured() {
+        if (_isLocalProvider !== null) return _isLocalProvider;
+        try {
+            if (typeof window !== 'undefined' && window && window.FORCE_LOCAL_ASYNC === true) {
+                _isLocalProvider = true; return true;
+            }
+        } catch (_) {}
+        try {
+            if (typeof process !== 'undefined' && process.env && process.env.LIVE_TRANSLATOR_LOCAL === '1') {
+                _isLocalProvider = true; return true;
+            }
+        } catch (_) {}
+        try {
+            const fs = require('fs');
+            const path = require('path');
+            const candidates = [
+                (__dirname ? path.join(__dirname) : null),
+                (_translatorModulePath ? path.dirname(_translatorModulePath) : null),
+                (typeof process !== 'undefined' && process.cwd ? path.join(process.cwd()) : null),
+                (typeof process !== 'undefined' && process.cwd ? path.join(process.cwd(), '..') : null),
+                (typeof process !== 'undefined' && process.cwd ? path.join(process.cwd(), 'www') : null),
+            ].filter(Boolean);
+            for (const dir of candidates) {
+                const p = path.join(dir, 'local.json');
+                if (fs.existsSync(p)) {
+                    try {
+                        const raw = fs.readFileSync(p, 'utf8');
+                        const cfg = JSON.parse(raw);
+                        if (cfg && (cfg.model || cfg.Model)) { _isLocalProvider = true; return true; }
+                    } catch (_) { /* ignore parse errors; try next */ }
+                }
+            }
+        } catch (_) { /* environment may not allow fs */ }
+        _isLocalProvider = false;
+        return false;
+    }
+
 
     function initializeTextReplacement() {
-        console.log('[INIT] Starting text replacement initialization...');
-        console.log('[INIT] Window_Base available:', typeof Window_Base !== 'undefined');
-        console.log('[INIT] Window_Base.prototype.drawText available:', typeof Window_Base !== 'undefined' && typeof Window_Base.prototype.drawText === 'function');
+        logger.info('[INIT] Starting text replacement initialization...');
+        logger.debug('[INIT] Window_Base available:', typeof Window_Base !== 'undefined');
+        logger.debug('[INIT] Window_Base.prototype.drawText available:', typeof Window_Base !== 'undefined' && typeof Window_Base.prototype.drawText === 'function');
         
         trackWindowState()
-        console.log('[INIT] trackWindowState completed');
+        logger.debug('[INIT] trackWindowState completed');
         
         trackWindowDrawText()
-        console.log('[INIT] trackWindowDrawText completed');
+        logger.debug('[INIT] trackWindowDrawText completed');
         
         trackGameMessage()
-        console.log('[INIT] trackGameMessage completed');
+        logger.debug('[INIT] trackGameMessage completed');
         
         trackChoiceList()
-        console.log('[INIT] trackChoiceList completed');
+        logger.debug('[INIT] trackChoiceList completed');
 
         if (SETTINGS.experimental && SETTINGS.experimental.helpWindowHooks) {
             trackHelpWindow()
@@ -339,17 +525,19 @@
             diag('[PIXI] text hooks disabled (experimental flag off)')
         }
         
-        console.log('[INIT] Text replacement initialization completed');
+        logger.info('[INIT] Text replacement initialization completed');
         
         // Show initial stats
         setTimeout(() => {
-            forceLog('═══ TEXT REPLACEMENT ADDON INITIALIZED ═══');
-            forceLog('Hooks installed: drawText, drawTextEx, Game_Message.clear, Window_Base.open/close/update');
-            if (SETTINGS.experimental.helpWindowHooks) forceLog('Experimental: Window_Help.setText enabled');
-            if (SETTINGS.experimental.bitmapTextHooks) forceLog('Experimental: Bitmap.drawText enabled');  
-            if (SETTINGS.experimental.pixiTextHooks) forceLog('Experimental: PIXI text hooks enabled');
+            logger.info('═══ TEXT REPLACEMENT ADDON INITIALIZED ═══');
+            logger.info('Hooks installed: drawText, drawTextEx, Game_Message.clear, Window_Base.open/close/update');
+            if (SETTINGS.experimental.helpWindowHooks) logger.info('Experimental: Window_Help.setText enabled');
+            if (SETTINGS.experimental.bitmapTextHooks) logger.info('Experimental: Bitmap.drawText enabled');  
+            if (SETTINGS.experimental.pixiTextHooks) logger.info('Experimental: PIXI text hooks enabled');
             // Translation target is determined by translator.js
-            forceLog(`Disk cache: ${diskCache.enabled ? 'enabled' : 'disabled'}`);
+            const maxEntries = diskCache.enabled ? diskCache.getMaxEntries() : 0;
+            const retention = maxEntries > 0 ? `${maxEntries} entries` : 'unlimited';
+            logger.info(`Disk cache: ${diskCache.enabled ? 'enabled' : 'disabled'}${diskCache.enabled ? ` (${retention})` : ''}`);
             diagnostics.showStats();
         }, 1000);
     }
@@ -423,12 +611,17 @@
             return null;
         }
 
+        const settings = (SETTINGS && typeof SETTINGS === 'object' && SETTINGS.diskCache && typeof SETTINGS.diskCache === 'object')
+            ? SETTINGS.diskCache
+            : {};
         const dir = (fs && path) ? resolveCacheDir() : null;
-        const enabled = !!(fs && path && dir && typeof dir === 'string');
+        const enabled = !!(fs && path && dir && typeof dir === 'string' && isLoggingEnabled() && settings.enabled !== false);
         const file = enabled ? path.join(dir, 'translation-cache.log') : null;
 
         // Serialize appends to avoid interleaving writes
         let queue = Promise.resolve();
+        let entryCount = null;
+        let launchPrepared = false;
 
         function safeParseLine(line) {
             const t = line && line.trim();
@@ -442,25 +635,132 @@
             return null;
         }
 
+        function getMaxEntries() {
+            if (!settings || !Object.prototype.hasOwnProperty.call(settings, 'maxEntries')) return DEFAULT_CACHE_LIMIT;
+            const num = Number(settings.maxEntries);
+            if (!isFinite(num) || num <= 0) return DEFAULT_CACHE_LIMIT;
+            return Math.floor(num);
+        }
+
+        function shouldClearOnLaunch() {
+            if (!settings || !Object.prototype.hasOwnProperty.call(settings, 'clearOnLaunch')) {
+                return false;
+            }
+            return !!settings.clearOnLaunch;
+        }
+
+        async function clearLogFile() {
+            if (!enabled) return;
+            entryCount = 0;
+            try {
+                await fs.promises.rm(file, { force: true });
+            } catch (e) {
+                try { await fs.promises.unlink(file); } catch (_) {}
+            }
+        }
+
+        function splitRecords(data) {
+            if (!data) return [];
+            const rows = data.split(/\r?\n/);
+            const out = [];
+            for (let i = 0; i < rows.length; i++) {
+                const line = rows[i];
+                if (!line) continue;
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                out.push(trimmed);
+            }
+            return out;
+        }
+
+        async function readAllRecords() {
+            if (!enabled) {
+                entryCount = 0;
+                return [];
+            }
+            try {
+                const data = await fs.promises.readFile(file, 'utf8');
+                const records = splitRecords(data);
+                entryCount = records.length;
+                return records;
+            } catch (_) {
+                entryCount = 0;
+                return [];
+            }
+        }
+
+        async function ensureEntryCount(forceRead) {
+            if (!enabled) return 0;
+            if (!forceRead && entryCount !== null) return entryCount;
+            const records = await readAllRecords();
+            return records.length;
+        }
+
+        async function pruneToLimit() {
+            if (!enabled) return;
+            const limit = getMaxEntries();
+            if (!limit || limit <= 0) {
+                await ensureEntryCount(false);
+                return;
+            }
+            const records = await readAllRecords();
+            if (records.length <= limit) return;
+            try {
+                try { await fs.promises.mkdir(dir, { recursive: true }); } catch (_) {}
+                const trimmed = records.slice(-limit);
+                const payload = trimmed.join('\n') + '\n';
+                await fs.promises.writeFile(file, payload, 'utf8');
+                entryCount = trimmed.length;
+            } catch (e) {
+                logger.error('[DiskCache Prune Error]', e);
+            }
+        }
+
+        async function prepareOnLaunch() {
+            if (!enabled || launchPrepared) return;
+            launchPrepared = true;
+            if (shouldClearOnLaunch()) {
+                await clearLogFile();
+                return;
+            }
+            await pruneToLimit();
+        }
+
+        async function ensureLaunchPrune() {
+            await prepareOnLaunch();
+        }
+
+        async function enforceLimitAfterAppend() {
+            const limit = getMaxEntries();
+            if (!limit || limit <= 0) return;
+            if (entryCount !== null && entryCount <= limit) return;
+            await pruneToLimit();
+        }
+
         async function appendRecord(input, output) {
             if (!enabled) return;
             const rec = JSON.stringify({ in: String(input), out: String(output) }) + '\n';
             queue = queue.then(async () => {
                 let handle;
                 try {
+                    await prepareOnLaunch();
+                    await ensureEntryCount(false);
                     try { await fs.promises.mkdir(dir, { recursive: true }); } catch (_) {}
                     handle = await fs.promises.open(file, 'a');
                     await handle.write(rec);
+                    entryCount = (entryCount || 0) + 1;
                     try { await handle.sync(); } catch (_) {}
                 } finally {
                     try { if (handle) await handle.close(); } catch (_) {}
                 }
+                await enforceLimitAfterAppend();
             }).catch(() => {});
             return queue;
         }
 
         async function loadAll() {
             if (!enabled) return [];
+            await prepareOnLaunch();
             try {
                 const exists = fs.existsSync(file);
                 if (!exists) return [];
@@ -473,19 +773,42 @@
                 }
                 return out;
             } catch (e) {
-                console.error('[DiskCache Load Error]', e);
+                logger.error('[DiskCache Load Error]', e);
                 return [];
             }
         }
 
-        return { enabled, appendRecord, loadAll };
+        return { enabled, appendRecord, loadAll, ensureLaunchPrune, getMaxEntries };
     })();
+
+    function getCacheEntryLimit() {
+        if (diskCache && typeof diskCache.getMaxEntries === 'function') {
+            const limit = diskCache.getMaxEntries();
+            return limit && limit > 0 ? limit : DEFAULT_CACHE_LIMIT;
+        }
+        const settings = SETTINGS && SETTINGS.diskCache ? SETTINGS.diskCache : null;
+        if (!settings) return DEFAULT_CACHE_LIMIT;
+        const max = Number(settings.maxEntries);
+        if (!isFinite(max) || max <= 0) return DEFAULT_CACHE_LIMIT;
+        return Math.floor(max);
+    }
+
+    function pruneMapToLimit(map, limit) {
+        if (!map || !isFinite(limit) || limit <= 0) return;
+        while (map.size >= limit) {
+            const first = map.keys().next();
+            if (first && !first.done) {
+                map.delete(first.value);
+            } else {
+                break;
+            }
+        }
+    }
 
     // Global translation cache system
     const translationCache = {
         // Completed translations: text -> translatedText
         completed: new Map(),
-        maxCacheSize: 1000, // Prevent unbounded growth
         
         // Ongoing translations: text -> Promise
         // Multiple text entries can share the same promise for the same text
@@ -504,7 +827,7 @@
                 return Promise.resolve(translatedText);
             }
             
-            // If translation already in progress, return existing promise
+            // If translation already in progress, return existing promise (dedupe for all providers)
             if (this.ongoing.has(normalizedText)) {
                 // diag(`[Cache PENDING] "${normalizedText}" - sharing existing request`);
                 return this.ongoing.get(normalizedText);
@@ -513,18 +836,18 @@
             // Start new translation
             diagnostics.logTranslation('cache_miss', normalizedText);
             const translationPromise = this.performTranslation(normalizedText);
+            // Always dedupe ongoing requests by text, including local
             this.ongoing.set(normalizedText, translationPromise);
             
             translationPromise
                 .then(translatedText => {
                     // Move from ongoing to completed with size limit
-                    this.ongoing.delete(normalizedText);
+                    try { this.ongoing.delete(normalizedText); } catch (_) {}
                     
-                    // Prevent unbounded cache growth
-                    if (this.completed.size >= this.maxCacheSize) {
-                        // Remove oldest entries (simple FIFO)
-                        const oldestKeys = Array.from(this.completed.keys()).slice(0, 100);
-                        oldestKeys.forEach(key => this.completed.delete(key));
+                    // Prevent unbounded cache growth (mirror disk cache limit)
+                    const limit = getCacheEntryLimit();
+                    if (limit > 0) {
+                        pruneMapToLimit(this.completed, limit);
                     }
                     
                     this.completed.set(normalizedText, translatedText);
@@ -564,7 +887,7 @@
             return !hasJapaneseOrChinese;
         },
 
-        // Perform actual translation using translator.js (DeepL)
+        // Perform actual translation using translator.js
         async performTranslation(text) {
             const normalized = String(text);
             if (this.shouldSkip(normalized)) {
@@ -574,24 +897,25 @@
 
             if (textProcessor && (typeof textProcessor.translateText === 'function' || typeof textProcessor.translateMany === 'function')) {
                 try {
+                    const id = (++_translateSeq) & 0x7FFFFFFF;
                     const t0 = performance.now();
-                    diag(`[DeepL] Request | in="${preview(normalized)}"`);
-                    // Batch-aware request: this queues with other pending texts into a single DeepL call.
-                    const out = await deepLBatcher.request(normalized);
+                    diag(`[Translate] #${id} Request | in="${preview(normalized)}"`);
+                    // Use unified batcher for both local and non-local providers
+                    const out = await translatorBatcher.request(normalized);
                     const t1 = performance.now();
                     const timing = Math.round(t1 - t0);
-                    diag(`[DeepL] OK ${timing}ms | out="${preview(out)}"`);
+                    diag(`[Translate] #${id} OK ${timing}ms | out="${preview(out)}"`);
                     return out || normalized;
                 } catch (err) {
-                    console.error('[DeepL Translation Failure]', err);
-                    diag('[DeepL] Failed');
+                    logger.error('[Translation Failure]', err);
+                    diag('[Translate] Failed');
                     // Important: propagate error so callers do NOT cache original
                     throw err;
                 }
             }
             // Fallback: no translator available
             const err = new Error('Translator unavailable');
-            console.error('[Translation] translator unavailable');
+            logger.error('[Translation] translator unavailable');
             throw err;
         }
     };
@@ -649,7 +973,7 @@
                                 const jitter = Math.floor(Math.random() * 250);
                                 state.intervalMs = Math.max(state.baseIntervalMs, retryMs);
                                 state.cooldownUntil = Date.now() + state.intervalMs + jitter;
-                                dbg(`[DeepL] 429 received. Backing off ~${state.intervalMs}ms`);
+                                dbg(`[Translate] 429 received. Backing off ~${state.intervalMs}ms`);
                             }
                         } catch (_) {}
                         reject(err);
@@ -670,61 +994,135 @@
         return { enqueue };
     })();
 
-    // Batch DeepL requests: coalesce multiple texts into one API call using translateMany.
-    const deepLBatcher = (() => {
-        const groups = new Map(); // key -> { queue: [{ text, resolve, reject }], timer }
-        const batchIntervalMs = 30; // short window to collect concurrent requests
-        const maxBatchSize = 25;    // conservative per-request batch size
+    // Unified translation batcher (local and DeepL):
+    // - Fires immediately when queue was empty
+    // - While a batch is in-flight, additional requests stack in the queue
+    // - Each batch includes up to 100 total characters across texts
+    // - DeepL batches use the rate limiter; local batches fire without throttling
+    const translatorBatcher = (() => {
+        const MAX_BATCH_CHARS = 100;
+        const state = {
+            queue: [], // Array<{ text, resolve, reject }>
+            running: false,
+        };
 
-        function keyFor() { return 'default'; }
-
-        function schedule(group) {
-            if (group.timer) return;
-            group.timer = setTimeout(() => flush(group), batchIntervalMs);
+        function takeNextBatch() {
+            if (!state.queue.length) return null;
+            let chars = 0;
+            const items = [];
+            while (state.queue.length) {
+                const next = state.queue[0];
+                const t = String(next.text);
+                const len = t.length;
+                if (items.length === 0) {
+                    // Always include at least one item
+                    items.push(state.queue.shift());
+                    chars += len;
+                } else {
+                    if (chars + len > MAX_BATCH_CHARS) break;
+                    items.push(state.queue.shift());
+                    chars += len;
+                }
+            }
+            return items;
         }
 
-        async function flush(group) {
-            group.timer = null;
-            if (!group.queue.length) return;
-            const items = group.queue.splice(0, maxBatchSize);
-            const texts = items.map(i => i.text);
+        async function run() {
+            if (state.running) return;
+            state.running = true;
             try {
-                const outputs = await rateLimiter.enqueue(() =>
-                    (typeof textProcessor.translateMany === 'function'
-                        ? textProcessor.translateMany(texts)
-                        : textProcessor.translateText(texts[0]).then(t => [t])
-                    )
-                );
-                for (let i = 0; i < items.length; i++) {
-                    const out = outputs && typeof outputs[i] === 'string' ? outputs[i] : '';
-                    items[i].resolve(out);
+                while (state.queue.length) {
+                    const items = takeNextBatch();
+                    if (!items || !items.length) break;
+                    const texts = items.map(i => String(i.text));
+                    try {
+                        const useLocal = isLocalProviderConfigured();
+                        if (useLocal) {
+                            // Local: launch each item independently; resolve as each finishes
+                            for (let i = 0; i < items.length; i++) {
+                                const it = items[i];
+                                Promise.resolve()
+                                    .then(() => textProcessor.translateText(String(it.text)))
+                                    .then(res => { try { it.resolve(typeof res === 'string' ? res : ''); } catch (_) {} })
+                                    .catch(err => { try { it.reject(err); } catch (_) {} });
+                            }
+                            // Do not await; continue to next queued batch immediately
+                            continue;
+                        } else {
+                            // DeepL or other: use rate limiter and translateMany when possible
+                            const outputs = await rateLimiter.enqueue(() =>
+                                (typeof textProcessor.translateMany === 'function'
+                                    ? textProcessor.translateMany(texts)
+                                    : Promise.all(texts.map(t => textProcessor.translateText(t)))
+                                )
+                            );
+                            for (let i = 0; i < items.length; i++) {
+                                const out = outputs && typeof outputs[i] === 'string' ? outputs[i] : '';
+                                items[i].resolve(out);
+                            }
+                        }
+                    } catch (err) {
+                        for (const it of items) it.reject(err);
+                    }
                 }
-            } catch (err) {
-                for (const it of items) it.reject(err);
+            } finally {
+                state.running = false;
             }
-            // If more remain, schedule next flush immediately
-            if (group.queue.length) schedule(group);
         }
 
         function request(text) {
             return new Promise((resolve, reject) => {
-                const k = keyFor();
-                let g = groups.get(k);
-                if (!g) { g = { queue: [], timer: null }; groups.set(k, g); }
-                g.queue.push({ text: String(text), resolve, reject });
-                if (g.queue.length >= maxBatchSize) {
-                    // Flush immediately when reaching max size
-                    if (g.timer) { clearTimeout(g.timer); g.timer = null; }
-                    // Fire and forget; do not await
-                    flush(g);
-                } else {
-                    schedule(g);
+                const wasEmpty = state.queue.length === 0 && !state.running;
+                state.queue.push({ text: String(text), resolve, reject });
+                if (wasEmpty) {
+                    // Fire immediately when queue was empty
+                    run();
                 }
+                // If already running, the request will stack and be processed next
             });
         }
 
         return { request };
     })();
+
+    const DRAW_STATE_KEYS = [
+        'fontFace',
+        'fontSize',
+        'fontBold',
+        'fontItalic',
+        'fontUnderline',
+        'fontGradient',
+        'textColor',
+        'outlineColor',
+        'outlineWidth',
+        'paintOpacity',
+        'gradientType',
+        'gradientColor1',
+        'gradientColor2'
+    ];
+
+    function captureBitmapDrawState(bitmap) {
+        if (!bitmap) return null;
+        const state = {};
+        let hasAny = false;
+        for (const key of DRAW_STATE_KEYS) {
+            const value = bitmap[key];
+            if (value !== undefined) {
+                state[key] = value;
+                hasAny = true;
+            }
+        }
+        return hasAny ? state : null;
+    }
+
+    function applyBitmapDrawState(bitmap, state) {
+        if (!bitmap || !state) return;
+        for (const key of DRAW_STATE_KEYS) {
+            if (Object.prototype.hasOwnProperty.call(state, key)) {
+                try { bitmap[key] = state[key]; } catch (_) {}
+            }
+        }
+    }
 
     function generateKey(type, x, y, windowType = null, text = null) {
         // For choice lists, always include text content to prevent key collisions
@@ -747,7 +1145,12 @@
         if (!windowData.recentlyRedrawn) windowData.recentlyRedrawn = new Map();
         windowRegistry.set(window, windowData);
         registeredWindows.add(window);
-        try { if (window && window.contents) contentsOwners.set(window.contents, window); } catch (_) {}
+        try {
+            if (window && window.contents) {
+                contentsOwners.set(window.contents, window);
+                window.contents._trPreferWindowPipeline = true;
+            }
+        } catch (_) {}
         // Remove spammy diagnostic - this gets called constantly
         // diag(`[Window Registry] Added ${windowData.windowType} (${window._uniqueId})`);
     }
@@ -765,10 +1168,24 @@
             windowData.pendingRedraws = new Map();
             if (!windowData.recentlyRedrawn) windowData.recentlyRedrawn = new Map();
         }
-        try { if (window && window.contents) contentsOwners.set(window.contents, window); } catch (_) {}
+        try {
+            if (window && window.contents) {
+                contentsOwners.set(window.contents, window);
+                window.contents._trPreferWindowPipeline = true;
+            }
+        } catch (_) {}
     }
 
-    function addTextToWindowData(windowData, text, x, y, type = null, convertedText = null, originalParams = null) {
+    function markEntryStale(windowData, key, entry) {
+        if (!entry) return;
+        entry._trStale = true;
+        entry.translationStatus = entry.translationStatus === "completed" ? "stale" : entry.translationStatus;
+        if (windowData && windowData.pendingRedraws) {
+            try { windowData.pendingRedraws.delete(key); } catch (_) {}
+        }
+    }
+
+    function addTextToWindowData(window, windowData, text, x, y, type = null, convertedText = null, originalParams = null) {
         const textToTranslate = convertedText || text;
         const textKey = generateKey(type, x, y, windowData.windowType, textToTranslate);
 
@@ -814,6 +1231,7 @@
             type: type,
             rawText: text,
             convertedText: trimmed,
+            drawState: captureBitmapDrawState(window && window.contents),
             translatedText: null,
             translationStatus: "pending", // "pending" | "translating" | "completed" | "error"
             translationPromise: null,
@@ -823,7 +1241,28 @@
             translationSource: translationSource,
             placeholderInfo: placeholderInfo,
         };
-        
+
+        // Prune stale duplicates for same text drawn elsewhere in the same window
+        try {
+            const dupKeys = [];
+            windowData.texts.forEach((entry, existingKey) => {
+                if (!entry || entry === textEntry) return;
+                if (entry.type !== type) return;
+                const sameConverted = entry.convertedText === trimmed;
+                const sameSource = translationSource && entry.translationSource === translationSource;
+                const sameRaw = entry.rawText === text;
+                if ((sameConverted || sameSource || sameRaw) &&
+                    (entry.position.x !== x || entry.position.y !== y)) {
+                    dupKeys.push(existingKey);
+                }
+            });
+            for (const dupKey of dupKeys) {
+                const staleEntry = windowData.texts.get(dupKey);
+                markEntryStale(windowData, dupKey, staleEntry);
+                windowData.texts.delete(dupKey);
+            }
+        } catch (_) {}
+
         windowData.texts.set(textKey, textEntry);
         // Clear any pending redraw queued for an older entry at this position
         try {
@@ -852,12 +1291,14 @@
 
     function requestTranslationForText(textEntry, text, windowData) {
         if (!text || !text.trim()) return;
+        if (textEntry._trStale) return;
         
         textEntry.translationStatus = "translating";
         textEntry.translationPromise = translationCache.requestTranslation(text);
         
         textEntry.translationPromise
             .then(translatedText => {
+                if (textEntry._trStale) return;
                 // Restore control codes if placeholders were used
                 const restored = textEntry.placeholderInfo
                     ? restoreControlCodes(translatedText, textEntry.placeholderInfo.placeholders, textEntry.placeholderInfo.original)
@@ -873,17 +1314,18 @@
                     return;
                 }
                 
-                // Find the window object and redraw
-                redrawTranslatedText(textEntry, windowData);
+                // Redraw immediately
+                try { redrawTranslatedText(textEntry, windowData); } catch (_) {}
             })
             .catch(error => {
-                console.error(`[Text Translation Error] for "${text}":`, error);
+                logger.error(`[Text Translation Error] for "${text}":`, error);
                 // Mark error but do NOT set translatedText to original to avoid cache/display contamination
                 textEntry.translationStatus = "error";
             });
     }
 
     function redrawTranslatedText(textEntry, windowData) {
+        if (textEntry._trStale) return;
         try {
             // Find the window object that owns this windowData
             let targetWindow = null;
@@ -927,7 +1369,7 @@
             const textKey = generateKey(textEntry.type, textEntry.position.x, textEntry.position.y, windowData.windowType, textEntry.convertedText);
             const currentEntry = windowData.texts.get(textKey);
             if (!currentEntry) {
-                console.log(`[Redraw Skip] Text was already cleared by game`);
+                logger.debug('[Redraw Skip] Text was already cleared by game');
                 return;
             }
             if (currentEntry !== textEntry) {
@@ -959,139 +1401,156 @@
             const signedText = REDRAW_SIGNATURE + translatedText;
 
             // Track cleared rectangle for diagnostics (used in logs below)
+            const contents = targetWindow.contents || null;
+            const prevDrawState = contents ? captureBitmapDrawState(contents) : null;
+            const storedDrawState = contents ? textEntry.drawState : null;
             let clearArea = null;
 
-            // Normal window clear logic
-            if (targetWindow.contents) {
-                const outline = Math.max(0, (targetWindow.contents && typeof targetWindow.contents.outlineWidth === 'number'
-                    ? targetWindow.contents.outlineWidth
-                    : SETTINGS.redraw.defaultOutline));
+            try {
+                if (contents && storedDrawState) {
+                    applyBitmapDrawState(contents, storedDrawState);
+                }
 
-                let clearX = x;
-                let clearY = y;
-                let clearW = 0;
-                let clearH = targetWindow.lineHeight();
+                if (contents) {
+                    const outline = Math.max(
+                        0,
+                        typeof contents.outlineWidth === 'number'
+                            ? contents.outlineWidth
+                            : SETTINGS.redraw.defaultOutline
+                    );
 
+                    let clearX = x;
+                    let clearY = y;
+                    let clearW = 0;
+                    let clearH = targetWindow.lineHeight();
+
+                    if (textEntry.type === 'drawText') {
+                        const params = textEntry.originalParams || {};
+                        const align = params.align || 'left';
+                        const contentsWidth = (typeof targetWindow.contentsWidth === 'function')
+                            ? targetWindow.contentsWidth()
+                            : (contents.width || 0);
+                        const avail = Math.max(
+                            0,
+                            (params.maxWidth && params.maxWidth > 0) ? params.maxWidth : (contentsWidth - x)
+                        );
+
+                        const widthOf = (t) => Math.ceil(targetWindow.textWidth(String(t)));
+                        const wOrig = widthOf(originalText);
+                        const wNew = widthOf(translatedText);
+
+                        const startFor = (w) => {
+                            if (align === 'center') return x + Math.max(0, Math.floor((avail - w) / 2));
+                            if (align === 'right') return x + Math.max(0, (avail - w));
+                            return x;
+                        };
+
+                        const sxOrig = startFor(wOrig);
+                        const exOrig = sxOrig + wOrig;
+                        const sxNew = startFor(wNew);
+                        const exNew = sxNew + wNew;
+
+                        const sx = Math.min(sxOrig, sxNew);
+                        const ex = Math.max(exOrig, exNew);
+
+                        clearX = sx;
+                        clearW = Math.max(0, ex - sx);
+
+                        const fontSize = (typeof contents.fontSize === 'number' && contents.fontSize > 0)
+                            ? Math.ceil(contents.fontSize)
+                            : (typeof targetWindow.standardFontSize === 'function'
+                                ? Math.ceil(targetWindow.standardFontSize())
+                                : targetWindow.lineHeight());
+                        const hBase = Math.min(targetWindow.lineHeight(), fontSize);
+                        const yOffset = Math.max(0, Math.floor((targetWindow.lineHeight() - hBase) / 2));
+                        clearY = y + yOffset;
+                        clearH = hBase;
+                    } else if (textEntry.type === 'drawTextEx') {
+                        const sizeFor = (txt) => {
+                            try {
+                                if (typeof targetWindow.textSizeEx === 'function') {
+                                    const sz = targetWindow.textSizeEx(String(txt));
+                                    return {
+                                        w: Math.ceil(sz.width || 0),
+                                        h: Math.ceil(sz.height || targetWindow.lineHeight())
+                                    };
+                                }
+                            } catch (e) { /* ignore measure errors */ }
+                            return {
+                                w: Math.ceil(targetWindow.textWidth(String(txt))),
+                                h: targetWindow.lineHeight()
+                            };
+                        };
+
+                        const origSize = sizeFor(textEntry.rawText || originalText);
+                        const transSize = sizeFor(translatedText);
+                        clearW = Math.max(origSize.w, transSize.w);
+                        clearH = Math.max(origSize.h, transSize.h);
+                    }
+
+                    clearX = Math.floor(clearX - outline - SETTINGS.redraw.extraPadding);
+                    clearY = Math.floor(clearY - outline - SETTINGS.redraw.extraPadding);
+                    clearW = Math.ceil(clearW + outline * 2 + SETTINGS.redraw.extraPadding * 2);
+                    clearH = Math.ceil(clearH + outline * 2 + SETTINGS.redraw.extraPadding * 2);
+
+                    const maxW = contents.width;
+                    const maxH = contents.height;
+                    const clampedX = Math.max(0, clearX);
+                    const clampedY = Math.max(0, clearY);
+                    const clampedW = Math.max(0, Math.min(clearW, maxW - clampedX));
+                    const clampedH = Math.max(0, Math.min(clearH, maxH - clampedY));
+
+                    contents.clearRect(clampedX, clampedY, clampedW, clampedH);
+                    clearArea = { x: clampedX, y: clampedY, w: clampedW, h: clampedH };
+                }
+
+                // Log the successful redraw with all context
+                diagnostics.logDraw('redraw', translatedText, x, y, {
+                    windowType: targetWindow.constructor.name,
+                    clearArea: clearArea
+                });
+
+                // Remove pending marker if present
+                try {
+                    const data = windowRegistry.get(targetWindow);
+                    if (data && data.pendingRedraws) data.pendingRedraws.delete(textKey);
+                } catch (_) {}
+
+                // Call the appropriate draw method with signed translated text using original parameters
                 if (textEntry.type === 'drawText') {
-                    // Clear only the union of original and translated text glyph bounds per alignment
-                    const params = textEntry.originalParams || {};
-                    const align = params.align || 'left';
-                    const contentsWidth = (typeof targetWindow.contentsWidth === 'function')
-                        ? targetWindow.contentsWidth()
-                        : (targetWindow.contents ? targetWindow.contents.width : 0);
-                    const avail = Math.max(0, (params.maxWidth && params.maxWidth > 0) ? params.maxWidth : (contentsWidth - x));
-
-                    const widthOf = (t) => Math.ceil(targetWindow.textWidth(String(t)));
-                    const wOrig = widthOf(originalText);
-                    const wNew  = widthOf(translatedText);
-
-                    const startFor = (w) => {
-                        if (align === 'center') return x + Math.max(0, Math.floor((avail - w) / 2));
-                        if (align === 'right')  return x + Math.max(0, (avail - w));
-                        return x; // left
-                    };
-
-                    const sxOrig = startFor(wOrig);
-                    const exOrig = sxOrig + wOrig;
-                    const sxNew  = startFor(wNew);
-                    const exNew  = sxNew + wNew;
-
-                    const sx = Math.min(sxOrig, sxNew);
-                    const ex = Math.max(exOrig, exNew);
-
-                    clearX = sx;
-                    clearW = Math.max(0, ex - sx);
-
-                    // Use a tighter height based on font size rather than full lineHeight
-                    const fontSize = (targetWindow.contents && typeof targetWindow.contents.fontSize === 'number' && targetWindow.contents.fontSize > 0)
-                        ? Math.ceil(targetWindow.contents.fontSize)
-                        : (typeof targetWindow.standardFontSize === 'function' ? Math.ceil(targetWindow.standardFontSize()) : targetWindow.lineHeight());
-                    const hBase = Math.min(targetWindow.lineHeight(), fontSize);
-                    const yOffset = Math.max(0, Math.floor((targetWindow.lineHeight() - hBase) / 2));
-                    clearY = y + yOffset;
-                    clearH = hBase;
-
+                    const params = textEntry.originalParams;
+                    const maxWidth = params.maxWidth !== undefined ? params.maxWidth : 0;
+                    const align = params.align !== undefined ? params.align : 'left';
+                    targetWindow.drawText(signedText, x, y, maxWidth, align);
                 } else if (textEntry.type === 'drawTextEx') {
-                    // Measure both original and translated text extents to clear sufficiently
-                    const sizeFor = (txt) => {
-                        try {
-                            if (typeof targetWindow.textSizeEx === 'function') {
-                                const sz = targetWindow.textSizeEx(String(txt));
-                                return { w: Math.ceil(sz.width || 0), h: Math.ceil(sz.height || targetWindow.lineHeight()) };
-                            }
-                        } catch (e) { /* ignore measure errors */ }
-                        // Fallback approximate
-                        return { w: Math.ceil(targetWindow.textWidth(String(txt))), h: targetWindow.lineHeight() };
-                    };
-
-                    // Use raw text for original (so control codes are considered), translated has no control codes
-                    const origSize = sizeFor(textEntry.rawText || originalText);
-                    const transSize = sizeFor(translatedText);
-                    clearW = Math.max(origSize.w, transSize.w);
-                    // Use measured height; avoid inflating to full lineHeight when not necessary
-                    clearH = Math.max(origSize.h, transSize.h);
+                    targetWindow.drawTextEx(signedText, x, y);
                 }
 
-                // Add padding to cover outlines/shadows and fractional positions
-                clearX = Math.floor(clearX - outline - SETTINGS.redraw.extraPadding);
-                clearY = Math.floor(clearY - outline - SETTINGS.redraw.extraPadding);
-                clearW = Math.ceil(clearW + outline * 2 + SETTINGS.redraw.extraPadding * 2);
-                clearH = Math.ceil(clearH + outline * 2 + SETTINGS.redraw.extraPadding * 2);
+                // After drawing, install a suppression rect on the contents bitmap
+                try {
+                    if (contents && clearArea && clearArea.w > 0 && clearArea.h > 0) {
+                        addBitmapSuppressionRect(contents, clearArea.x, clearArea.y, clearArea.x + clearArea.w, clearArea.y + clearArea.h, 120, translatedText);
+                    }
+                } catch (_) {}
 
-                // Clamp to contents bounds
-                const maxW = targetWindow.contents ? targetWindow.contents.width : clearW;
-                const maxH = targetWindow.contents ? targetWindow.contents.height : clearH;
-                const clampedX = Math.max(0, clearX);
-                const clampedY = Math.max(0, clearY);
-                const clampedW = Math.max(0, Math.min(clearW, maxW - clampedX));
-                const clampedH = Math.max(0, Math.min(clearH, maxH - clampedY));
+                // Mark recently redrawn to avoid immediate duplicate inline draws for this slot
+                try {
+                    const rrKey = generateKey(textEntry.type, x, y, windowData.windowType, textEntry.convertedText);
+                    const data = windowRegistry.get(targetWindow);
+                    if (data) {
+                        if (!data.recentlyRedrawn) data.recentlyRedrawn = new Map();
+                        data.recentlyRedrawn.set(rrKey, Date.now());
+                    }
+                } catch (_) {}
 
-                targetWindow.contents.clearRect(clampedX, clampedY, clampedW, clampedH);
-                clearArea = { x: clampedX, y: clampedY, w: clampedW, h: clampedH };
-            }
-            
-            // Log the successful redraw with all context
-            diagnostics.logDraw('redraw', translatedText, x, y, {
-                windowType: targetWindow.constructor.name,
-                clearArea: clearArea
-            });
-            
-            // Remove pending marker if present
-            try {
-                const data = windowRegistry.get(targetWindow);
-                if (data && data.pendingRedraws) data.pendingRedraws.delete(textKey);
-            } catch (_) {}
-
-            // Call the appropriate draw method with signed translated text using original parameters
-            if (textEntry.type === 'drawText') {
-                const params = textEntry.originalParams;
-                const maxWidth = params.maxWidth !== undefined ? params.maxWidth : 0;
-                const align = params.align !== undefined ? params.align : 'left';
-                targetWindow.drawText(signedText, x, y, maxWidth, align);
-            } else if (textEntry.type === 'drawTextEx') {
-                targetWindow.drawTextEx(signedText, x, y);
+            } finally {
+                if (contents && prevDrawState) {
+                    applyBitmapDrawState(contents, prevDrawState);
+                }
             }
 
-            // After drawing, install a suppression rect on the contents bitmap
-            try {
-                const bmp = targetWindow.contents;
-                if (bmp && clearArea && clearArea.w > 0 && clearArea.h > 0) {
-                    addBitmapSuppressionRect(bmp, clearArea.x, clearArea.y, clearArea.x + clearArea.w, clearArea.y + clearArea.h, 120, translatedText);
-                }
-            } catch (_) {}
-
-            // Mark recently redrawn to avoid immediate duplicate inline draws for this slot
-            try {
-                const rrKey = generateKey(textEntry.type, x, y, windowData.windowType, textEntry.convertedText);
-                const data = windowRegistry.get(targetWindow);
-                if (data) {
-                    if (!data.recentlyRedrawn) data.recentlyRedrawn = new Map();
-                    data.recentlyRedrawn.set(rrKey, Date.now());
-                }
-            } catch (_) {}
-            
         } catch (error) {
-            console.error(`[Redraw Error]`, error);
+            logger.error(`[Redraw Error]`, error);
         }
     }
 
@@ -1146,7 +1605,7 @@
                     }
                 }
             } catch (e) {
-                console.error('[Window_Base.update Hook Error]', e);
+                logger.error('[Window_Base.update Hook Error]', e);
             }
             return res;
         };
@@ -1183,21 +1642,21 @@
                         }
                         this._trPendingRedraw = null;
                     }
-                } catch (e) { console.warn('[Window_Message.update pending redraw error]', e); }
+                } catch (e) { logger.warn('[Window_Message.update pending redraw error]', e); }
                 return r;
             };
         }
-    } catch (e) { console.warn('[Init] Window_Message update hook error', e); }
+    } catch (e) { logger.warn('[Init] Window_Message update hook error', e); }
 
     function trackWindowDrawText() {
-        console.log('[HOOK INSTALL] Installing drawText hooks...');
-        console.log('[HOOK INSTALL] Window_Base:', typeof Window_Base);
-        console.log('[HOOK INSTALL] Window_Base.prototype:', typeof Window_Base !== 'undefined' ? typeof Window_Base.prototype : 'undefined');
-        console.log('[HOOK INSTALL] drawText method:', typeof Window_Base !== 'undefined' && Window_Base.prototype ? typeof Window_Base.prototype.drawText : 'undefined');
+        logger.debug('[HOOK INSTALL] Installing drawText hooks...');
+        logger.trace('[HOOK INSTALL] Window_Base:', typeof Window_Base);
+        logger.trace('[HOOK INSTALL] Window_Base.prototype:', typeof Window_Base !== 'undefined' ? typeof Window_Base.prototype : 'undefined');
+        logger.trace('[HOOK INSTALL] drawText method:', typeof Window_Base !== 'undefined' && Window_Base.prototype ? typeof Window_Base.prototype.drawText : 'undefined');
         
         // DrawText
         const originalDrawText = Window_Base.prototype.drawText;
-        console.log('[HOOK INSTALL] Original drawText saved:', typeof originalDrawText);
+        logger.trace('[HOOK INSTALL] Original drawText saved:', typeof originalDrawText);
 
         Window_Base.prototype.drawText = function (text, x, y, maxWidth, align) {
             // Convert text to string if it isn't already (numbers, etc.)
@@ -1250,7 +1709,7 @@
 
             // Save original parameters for redraw
             const originalParams = { maxWidth, align };
-            addTextToWindowData(windowData, trimmed, x, y, "drawText", null, originalParams)
+            addTextToWindowData(this, windowData, trimmed, x, y, "drawText", null, originalParams);
             // If translation already cached, draw translated inline unless we just redrew this slot
             try {
                 const norm = trimmed;
@@ -1346,7 +1805,7 @@
             const prep = prepareTextForTranslation(convertedText);
             // DrawTextEx doesn't have additional parameters like maxWidth/align
             const originalParams = {};
-            addTextToWindowData(windowData, trimmed, x, y, "drawTextEx", convertedText, originalParams)
+            addTextToWindowData(this, windowData, trimmed, x, y, "drawTextEx", convertedText, originalParams);
             // If translation already cached (using control-code-free text), draw translated inline
             try {
                 const norm = String(prep.textForTranslation || trimmed).trim();
@@ -1382,7 +1841,7 @@
             return originalDrawTextEx.call(this, text, x, y);
         };
         
-        console.log('[HOOK INSTALL] drawText and drawTextEx hooks installed successfully');
+        logger.info('[HOOK INSTALL] drawText and drawTextEx hooks installed successfully');
     }
 
     function trackChoiceList() {
@@ -1440,7 +1899,7 @@
                         }
                     }
                 } catch (e) {
-                    console.error('[Choice makeCommandList Hook Error]', e);
+                    logger.error('[Choice makeCommandList Hook Error]', e);
                 }
 
                 return result;
@@ -1448,7 +1907,7 @@
 
             dbg('[Choice] Hooked Window_ChoiceList.makeCommandList');
         } catch (e) {
-            console.error('[Choice Hook Error]', e);
+            logger.error('[Choice Hook Error]', e);
         }
     }
 
@@ -1488,7 +1947,7 @@
                         this.processCompleteMessage(finalText, gameMessageState.session);
                     }
                 }
-            } catch (e) { console.warn('[GameMessage startMessage hook error]', e); }
+            } catch (e) { logger.warn('[GameMessage startMessage hook error]', e); }
             return originalStartMessage.call(this);
         };
 
@@ -1586,7 +2045,7 @@
                         }
                     } catch (e) {
                         // Fallback if newLineX() fails due to uninitialized state
-                        console.warn('[GameMessage] newLineX() failed, using fallback:', e);
+                        logger.warn('[GameMessage] newLineX() failed, using fallback:', e);
                         startX = (typeof this.textPadding === 'function') ? this.textPadding() : 0;
                     }
 
@@ -1606,7 +2065,7 @@
                     }
                 })
                 .catch(err => {
-                    console.error('[GameMessage Translation Error]', err);
+                    logger.error('[GameMessage Translation Error]', err);
                 });
         };
 
@@ -1635,16 +2094,16 @@
         };
 
         function showGameMessageDiagnostics() {
-            if (!SETTINGS.debug.diagnostics) return;
-            console.log('=== GAME MESSAGE DIAGNOSTICS ===');
+            if (!logger.shouldLog('trace')) return;
+            logger.trace('=== GAME MESSAGE DIAGNOSTICS ===');
             const status = gameMessageState.isActive ? 'ACTIVE' : 'CLEARED';
             const timestamp = new Date(gameMessageState.lastUpdate).toLocaleTimeString();
             
-            console.log(`GameMessage [${status}|${timestamp}]`);
+            logger.trace(`GameMessage [${status}|${timestamp}]`);
             if (gameMessageState.currentText) {
-                console.log(`   Final text: "${gameMessageState.currentText}"`);
+                logger.trace(`   Final text: "${gameMessageState.currentText}"`);
             } else {
-                console.log('   (No text)');
+                logger.trace('   (No text)');
             }
         }
     }
@@ -1653,8 +2112,8 @@
         // let disable = true; // implement global settings later
         // if (disable) return;
 
-        if (!SETTINGS.debug.diagnostics) return;
-        console.log('=== SCREEN TEXT DIAGNOSTICS ===');
+        if (!logger.shouldLog('trace')) return;
+        logger.trace('=== SCREEN TEXT DIAGNOSTICS ===');
         
         let totalTexts = 0;
         let displayedWindows = 0;
@@ -1694,10 +2153,10 @@
             const types = [...new Set(textTypes)].join(',');
             const latestTimestamp = timestamps.length > 0 ? timestamps[timestamps.length - 1] : 'N/A';
             
-            console.log(`${displayedWindows}: ${window.constructor.name} [${status}|${visible}|${textCount}txt|${types}|${latestTimestamp}] (obj#${window._uniqueId || 'no-id'})`);
+            logger.trace(`${displayedWindows}: ${window.constructor.name} [${status}|${visible}|${textCount}txt|${types}|${latestTimestamp}] (obj#${window._uniqueId || 'no-id'})`);
             
             // Second line: Texts
-            console.log(`   ${texts.join(' | ')}`);
+            logger.trace(`   ${texts.join(' | ')}`);
             
             // Third line: Show converted text if any differ from raw text
             const convertedTexts = [];
@@ -1712,7 +2171,7 @@
             });
             
             if (hasConversions) {
-                console.log(`   [Converted: ${convertedTexts.filter(t => t).join(' | ')}]`);
+                logger.trace(`   [Converted: ${convertedTexts.filter(t => t).join(' | ')}]`);
             }
 
             // Fourth line: Show translation status and results
@@ -1733,11 +2192,11 @@
             });
             
             if (hasTranslations) {
-                console.log(`   [Translation: ${translationInfo.filter(t => t).join(' | ')}]`);
+                logger.trace(`   [Translation: ${translationInfo.filter(t => t).join(' | ')}]`);
             }
         });
         
-        console.log(`Total windows: ${displayedWindows}, Total texts: ${totalTexts}`);
+        logger.trace(`Total windows: ${displayedWindows}, Total texts: ${totalTexts}`);
     }
 
     // Hook PIXI.Text and PIXI.BitmapText to capture whole-string text assignments
@@ -1844,7 +2303,7 @@
             try { hookedAny = installSetterHook(PIXIObj.BitmapText, 'PIXI.BitmapText') || hookedAny; } catch (_) {}
             if (!hookedAny) diag('[PIXI] No text classes hooked');
         } catch (e) {
-            console.error('[PIXI Hook Error]', e);
+            logger.error('[PIXI Hook Error]', e);
         }
     }
 
@@ -1893,6 +2352,8 @@
                     const width = Math.max(0, maxX - minX);
                     const y = line.y;
                     const h = Math.max(Number(line.lineHeight) || 0, bitmap.fontSize || 24);
+                    const storedState = line.drawState || null;
+                    const previousState = captureBitmapDrawState(bitmap) || {};
 
                     // Cache path: immediate substitute
                     if (translationCache.completed.has(norm)) {
@@ -1900,7 +2361,8 @@
                         if (translated && translated !== norm) {
                             try { bitmap.clearRect(Math.max(0,minX-1), Math.max(0,y-1), width+2, h+2); } catch (_) {}
                             const signed = REDRAW_SIGNATURE + translated;
-                            try { 
+                            try {
+                                if (storedState) applyBitmapDrawState(bitmap, storedState);
                                 const r = original.call(bitmap, signed, minX, y, width, h, 'left');
                                 line.recentFlush = { x1: minX, x2: maxX, t: Date.now() };
                                 // Install suppression rect to ignore overlapping residual fragments briefly
@@ -1908,18 +2370,25 @@
                                 rects.push({ x1: Math.max(0,minX-1), y1: Math.max(0,y-1), x2: maxX+1, y2: y + Math.max(1,h) - 1, exp: Date.now() + 120, content: String(translated) });
                                 supMap.set(bitmap, rects);
                                 return r;
-                            } finally { line.items = []; }
+                            } finally {
+                                applyBitmapDrawState(bitmap, previousState);
+                                line.items = [];
+                                line.drawState = null;
+                            }
                         }
-                        line.items = []; return;
+                        line.items = [];
+                        line.drawState = null;
+                        return;
                     }
 
                     // Async path: draw original now (already drawn), request translation, then clear+redraw when ready
                     translationCache.requestTranslation(norm)
                         .then(translated => {
                             try {
-                                if (!translated || translated === norm) { line.items = []; return; }
+                                if (!translated || translated === norm) { line.items = []; line.drawState = null; return; }
                                 try { bitmap.clearRect(Math.max(0,minX-1), Math.max(0,y-1), width+2, h+2); } catch (_) {}
                                 const signed = REDRAW_SIGNATURE + translated;
+                                if (storedState) applyBitmapDrawState(bitmap, storedState);
                                 original.call(bitmap, signed, minX, y, width, h, 'left');
                                 line.recentFlush = { x1: minX, x2: maxX, t: Date.now() };
                                 const rects = supMap.get(bitmap) || [];
@@ -1928,9 +2397,13 @@
                             } catch (_) {}
                         })
                         .catch(()=>{})
-                        .finally(()=>{ line.items = []; });
+                        .finally(()=>{
+                            applyBitmapDrawState(bitmap, previousState);
+                            line.items = [];
+                            line.drawState = null;
+                        });
                 } catch (_) {
-                    try { line.items = []; } catch (_) {}
+                    try { line.items = []; line.drawState = null; } catch (_) {}
                 }
             }
 
@@ -1938,6 +2411,12 @@
                 try {
                     const textStr = String(text);
                     if (!textStr) return original.apply(this, arguments);
+
+                    let owner = null;
+                    try { owner = contentsOwners.get(this) || null; } catch (_) {}
+                    if (owner && owner.contents && owner.contents._trPreferWindowPipeline) {
+                        return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                    }
 
                     // candidate logging disabled
 
@@ -1982,7 +2461,6 @@
 
                     // Exclude message window contents: let Window_Message pipeline handle it exclusively
                     try {
-                        const owner = contentsOwners.get(this);
                         if (owner && owner.constructor && owner.constructor.name === 'Window_Message') {
                             return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
                         }
@@ -2051,7 +2529,18 @@
                         const agg = getAgg(this);
                         const key = yKeyFor(y);
                         let line = agg.lines.get(key);
-                        if (!line) { line = { y: Math.round(Number(y)||0), items: [], lastX: Number(x)||0, lastW: 0, lineHeight: lineHeight||24, timer: null }; agg.lines.set(key, line); }
+                        if (!line) {
+                            line = {
+                                y: Math.round(Number(y)||0),
+                                items: [],
+                                lastX: Number(x)||0,
+                                lastW: 0,
+                                lineHeight: lineHeight||24,
+                                timer: null,
+                                drawState: captureBitmapDrawState(this)
+                            };
+                            agg.lines.set(key, line);
+                        }
 
                         // Measure width to decide adjacency
                         let w = 0;
@@ -2074,11 +2563,20 @@
                                 // Different run; flush old then start new
                                 if (line.timer) clearTimeout(line.timer);
                                 flushLine(this, key, line);
-                                line = { y: Math.round(Number(y)||0), items: [], lastX: xi, lastW: w, lineHeight: lineHeight||24, timer: null };
+                                line = {
+                                    y: Math.round(Number(y)||0),
+                                    items: [],
+                                    lastX: xi,
+                                    lastW: w,
+                                    lineHeight: lineHeight||24,
+                                    timer: null,
+                                    drawState: captureBitmapDrawState(this)
+                                };
                                 agg.lines.set(key, line);
                             }
                         }
 
+                        if (!line.drawState) line.drawState = captureBitmapDrawState(this);
                         line.items.push({ x: xi, text: trimmed, w });
                         line.lastX = xi;
                         line.lastW = w;
@@ -2111,13 +2609,13 @@
                     translationCache.requestTranslation(norm).catch(() => {});
                     return res;
                 } catch (e) {
-                    console.error('[Bitmap.drawText Hook Error]', e);
+                    logger.error('[Bitmap.drawText Hook Error]', e);
                     return original.apply(this, arguments);
                 }
             };
             dbg('[Bitmap] Hooked Bitmap.drawText');
         } catch (e) {
-            console.error('[Bitmap Hook Error]', e);
+            logger.error('[Bitmap Hook Error]', e);
         }
     }
 
@@ -2185,13 +2683,13 @@
                         .catch(() => { /* keep original on failure */ });
                     return res;
                 } catch (e) {
-                    console.error('[Window_Help.setText Hook Error]', e);
+                    logger.error('[Window_Help.setText Hook Error]', e);
                     return originalSetText.call(this, text);
                 }
             };
             dbg('[Help] Hooked Window_Help.setText');
         } catch (e) {
-            console.error('[Help Hook Error]', e);
+            logger.error('[Help Hook Error]', e);
         }
     }
 
@@ -2201,14 +2699,18 @@
             try {
                 if (!diskCache.enabled) return;
                 const records = await diskCache.loadAll();
+                const limit = getCacheEntryLimit();
                 for (const rec of records) {
                     if (rec && typeof rec.in === 'string' && typeof rec.out === 'string') {
+                        if (limit > 0) {
+                            pruneMapToLimit(translationCache.completed, limit);
+                        }
                         translationCache.completed.set(rec.in.trim(), rec.out);
                     }
                 }
                 dbg(`[DiskCache] Loaded ${records.length} records`);
             } catch (e) {
-                console.error('[DiskCache Hydrate Error]', e);
+                logger.error('[DiskCache Hydrate Error]', e);
             }
         };
 

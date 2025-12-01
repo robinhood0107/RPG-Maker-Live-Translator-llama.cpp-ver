@@ -7,7 +7,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "cp \"${workspaceFolder}/install\" \"${workspaceFolder}/installer.ps1\" \"${workspaceFolder}/installer.sh\" \"${workspaceFolder}/text-replacement-addon.js\" \"${workspaceFolder}/translator.js\" \"${workspaceFolder}/apikey.txt\" \"${workspaceFolder}/experimentation/\" && cd \"${workspaceFolder}/experimentation\" && ./install"
+                "cp \"${workspaceFolder}/install\" \"${workspaceFolder}/installer.ps1\" \"${workspaceFolder}/installer.sh\" \"${workspaceFolder}/text-replacement-addon.js\" \"${workspaceFolder}/translator.js\" \"${workspaceFolder}/local.json\"\"${workspaceFolder}/apikey.txt\" \"${workspaceFolder}/experimentation/\" && cd \"${workspaceFolder}/experimentation\" && ./install"
             ],
             "group": "build",
             "options": { "cwd": "${workspaceFolder}" },
@@ -23,7 +23,7 @@
                 "args": [
                     "-ExecutionPolicy", "Bypass",
                     "-Command",
-                    "& { Copy-Item install,installer.ps1,installer.sh,text-replacement-addon.js,translator.js,apikey.txt -Destination \".\\experimentation\" -Force; Set-Location -LiteralPath \".\\experimentation\"; .\\installer.ps1 }"
+                    "& { Copy-Item install,installer.ps1,installer.sh,text-replacement-addon.js,translator.js,local.json,apikey.txt -Destination \".\\experimentation\" -Force; Set-Location -LiteralPath \".\\experimentation\"; .\\installer.ps1 }"
                 ]
             }
         }
