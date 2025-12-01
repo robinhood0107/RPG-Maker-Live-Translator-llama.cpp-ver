@@ -7,9 +7,8 @@
     "debug": {
         "level": "trace"
     },
-    "redraw": {
-        "extraPadding": 0,
-        "defaultOutline": 0
+    "translation": {
+        "disableCjkFilter": false
     },
     "diskCache": {
         "enabled": true,

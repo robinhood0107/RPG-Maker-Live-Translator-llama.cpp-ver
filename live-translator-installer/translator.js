@@ -110,16 +110,17 @@
     // DeepL implementation (batch)
     async function translateManyDeepL(texts, targetLang, apiKey) {
         try {
+            const body = new URLSearchParams();
+            texts.forEach(t => body.append('text', String(t)));
+            body.append('target_lang', targetLang);
+
             const response = await fetch('https://api-free.deepl.com/v2/translate', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
+                    'Content-Type': 'application/x-www-form-urlencoded',
                     'Authorization': `DeepL-Auth-Key ${apiKey}`
                 },
-                body: JSON.stringify({
-                    text: texts.map(t => String(t)),
-                    target_lang: targetLang
-                })
+                body: body.toString()
             });
 
             if (!response.ok) {

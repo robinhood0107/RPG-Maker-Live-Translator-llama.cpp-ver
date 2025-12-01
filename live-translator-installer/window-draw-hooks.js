@@ -21,7 +21,6 @@
             captureBitmapDrawState,
             applyBitmapDrawState,
             preview = (text) => String(text ?? ''),
-            SETTINGS = {},
             REDRAW_SIGNATURE = '',
             diag = () => {},
             dbg = () => {},
@@ -49,7 +48,7 @@
             throw new Error('[WindowDrawHooks] capture/apply bitmap helpers are required.');
         }
 
-        const redrawSettings = SETTINGS.redraw || { extraPadding: 0, defaultOutline: 0 };
+        const redrawSettings = { extraPadding: 0, defaultOutline: 0 };
 
         function addBitmapSuppressionRect(bitmap, x1, y1, x2, y2, durationMs = 200, content = null) {
             try {

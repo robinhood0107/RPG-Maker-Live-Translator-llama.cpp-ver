@@ -229,6 +229,7 @@
             pruneMapToLimit = () => {},
             translatorBatcher,
             diag = noop,
+            settings = {},
         } = options || {};
 
         const logError = typeof logger.error === 'function' ? logger.error.bind(logger) : console.error;
@@ -248,6 +249,10 @@
             if (!text) return true;
             const trimmed = String(text).trim();
             if (!trimmed) return true;
+            const disableCjkFilter = !!(settings
+                && settings.translation
+                && settings.translation.disableCjkFilter);
+            if (disableCjkFilter) return false;
             const hasKorean = /[\uAC00-\uD7AF]/u.test(trimmed);
             if (hasKorean) return true;
             const hasJapaneseOrChinese = /[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]/u.test(trimmed);
@@ -342,6 +347,7 @@
             isLocalProvider = false,
             dbg,
             diag,
+            settings = {},
         } = options;
 
         const rateLimiter = createRateLimiter({ dbg });
@@ -362,6 +368,7 @@
             pruneMapToLimit,
             translatorBatcher,
             diag,
+            settings,
         });
 
         return { translationCache };

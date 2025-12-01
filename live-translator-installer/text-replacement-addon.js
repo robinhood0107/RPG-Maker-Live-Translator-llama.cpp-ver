@@ -309,6 +309,7 @@
         isLocalProvider: USING_LOCAL_PROVIDER,
         dbg,
         diag,
+        settings: cachedSettings,
     });
 
     if (!translationManagerInstance || !translationManagerInstance.translationCache) {
