@@ -1,0 +1,20 @@
+{
+    "provider": "deepl",
+    "settings": {
+        "local": {
+            "address": "127.0.0.1",
+            "port": 1234,
+            "model": "yanoljanext-rosetta-27b-2511-i1@iq3_m",
+            "system_prompt": "Translate the user's text into Korean.",
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 64,
+            "min_p": 0.00,
+            "repeat_penalty": 1.1
+        },
+        "deepl": {
+            "language": "KO",
+            "apiKey": null
+        }
+    }
+}

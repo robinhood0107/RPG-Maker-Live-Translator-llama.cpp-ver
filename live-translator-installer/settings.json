@@ -1,0 +1,19 @@
+{
+    "logging": {
+        "enabled": false,
+        "suppressExact": [
+        ]
+    },
+    "debug": {
+        "level": "trace"
+    },
+    "redraw": {
+        "extraPadding": 0,
+        "defaultOutline": 0
+    },
+    "diskCache": {
+        "enabled": true,
+        "maxMegabytes": 2048,
+        "clearOnLaunch": false
+    }
+}

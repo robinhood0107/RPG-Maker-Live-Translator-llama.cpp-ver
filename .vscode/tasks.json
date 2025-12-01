@@ -7,7 +7,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "cp \"${workspaceFolder}/install\" \"${workspaceFolder}/installer.ps1\" \"${workspaceFolder}/installer.sh\" \"${workspaceFolder}/text-replacement-addon.js\" \"${workspaceFolder}/translator.js\" \"${workspaceFolder}/local.json\"\"${workspaceFolder}/apikey.txt\" \"${workspaceFolder}/experimentation/\" && cd \"${workspaceFolder}/experimentation\" && ./install"
+                "cp -r \"${workspaceFolder}/live-translator-installer\" \"${workspaceFolder}/${input:experimentationFolder}/\" && cd \"${workspaceFolder}/${input:experimentationFolder}\" && ./live-translator-installer/install"
             ],
             "group": "build",
             "options": { "cwd": "${workspaceFolder}" },
@@ -23,9 +23,22 @@
                 "args": [
                     "-ExecutionPolicy", "Bypass",
                     "-Command",
-                    "& { Copy-Item install,installer.ps1,installer.sh,text-replacement-addon.js,translator.js,local.json,apikey.txt -Destination \".\\experimentation\" -Force; Set-Location -LiteralPath \".\\experimentation\"; .\\installer.ps1 }"
+                    "Copy-Item .\\live-translator-installer -Destination .\\${input:experimentationFolder} -Recurse -Force; Set-Location -LiteralPath .\\${input:experimentationFolder}; .\\live-translator-installer\\installer.ps1"
                 ]
             }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "experimentationFolder",
+            "type": "pickString",
+            "description": "Select which experimentation folder to prepare and launch with.",
+            "options": [
+                "experimentation_c",
+                "experimentation_t",
+                "experimentation"
+            ],
+            "default": "experimentation"
         }
     ]
 }

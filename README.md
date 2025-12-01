@@ -1,7 +1,7 @@
 ## Overview
 RPG Maker MV / MZ addon to translate all text that gets drawn on the screen. You must provide your own DeepL API key.
 
-Since RPG Maker is a scriptable platform, no implementation of a translator will work against every game. Chances are that many games will have subtle issues or won't work at all unless you debug (fix this script) yourself.
+Since RPG Maker is a scriptable platform, no implementation of a translator will work against every game. Chances are that many games will have subtle issues or won't work at all unless you debug yourself.
 
 ## Implementation
 1. Tries to detect all kinds of texts being drawn on the screen and read its contents.
@@ -16,38 +16,22 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 2. (Required for some games) Update the game's included nw.js library. All RPGMV/MZ games ship with nwjs installations - sometimes with very outdated ones that will not work with this addon. https://nwjs.io/downloads/ - Extract all files to the game directory (where Game.exe is) and change the name of nwjs.exe to Game.exe. 
 
 ## Instructions (Installer):
-1. Download all files (excluding .vscode files) and unzip to the game folder.
-2. Create apikey.txt containing your DeepL API key.
-3. Right-click `installer.ps1` → `Run with PowerShell`. If blocked, open up powershell console and `Set-ExecutionPolicy -Scope Process Bypass`. If you're confused, ask ChatGPT to guide you through with executing a `ps1` powershell script.
-4. Open up translator.js with notepad or vscode and change `SETTINGS.translation.targetLang` (such as EN).
+1. Download all files and copy `live-translator-installer/` to the game's folder (where Game.exe resides).
+2. Right-click `live-translator-installer/installer.ps1` → `Run with PowerShell`. If blocked, open up powershell console as administrator and run `Set-ExecutionPolicy Bypass -Scope LocalMachine`. If you're confused, ask ChatGPT.
 
 ## Instructions (Manual):
-1. Copy `text-replacement-addon.js` to `js/plugins/` folder and add an entry to `plugins.js` file.
-2. Inspect `package.json` and make sure `name` field is not empty.
-3. Open up translator.js with your notepad and change `SETTINGS.translation.targetLang` to the language of your choice (like `EN`).
+1. Copy `live-translator-installer/live-translator-loader.js` to the `js/plugins/` folder and add an entry to `plugins.js`.
+2. Copy `live-translator-installer` to the `js/plugins/` folder.
+3. Inspect `package.json` and make sure `name` field is not empty.
+4. Go to `js/plugins/` or `www/js/plugins` to edit `live-translator-installer/translator.json`. For DeepL, set `"provider": "deepl"`, configure `settings.deepl.language`, and paste your API key into `settings.deepl.apiKey`. To use a OpenAI compatible API (like LM Studio), set `"provider": "local"` and set your language. The files in the `installer` folder are not active!
 
-## Local LLM Setup (LM Studio)
-1. Run LM Studio Local Inference Server (OpenAI-compatible) on your machine.
-2. Create `local.json` next to `translator.js` with settings:
-   {
-     "address": "127.0.0.1",
-     "port": 1234,
-     "model": "yanoljanext-rosetta-27b-2511-i1",
-     "system_prompt": "You are a translation engine.",
-     "temperature": 0.2,
-     "top_k": 40,
-     "repeat_penalty": 1.1,
-     "min_p": 0.05,
-     "top_p": 0.95
-   }
-
-## Dev Environment and Troubleshooting:
+## Dev Environment and Troubleshooting (Recommended):
 1. Install `nwjs debugger for VSCode` plugin - https://marketplace.visualstudio.com/items?itemName=ruakr.vsc-nwjs
 2. Put the game inside `experimentation/` folder.
 3. Use included `launch.json` configurations to launch nwjs debugging session.
 4. Open up your vibecodingpromasterTM software of your choice because surely you're not manually debugging this 2000 line jank like what, some kind of a caveman.
 
 ## Changelog
-0.2 - Try to mitigate occasional overlapping text draws
+0.5 - major refactor - performance and accuracy improvements, etc
 
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

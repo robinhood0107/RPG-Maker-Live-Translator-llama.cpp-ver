@@ -2,22 +2,35 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "NWjs (webRoot: experimentation)",
+            "name": "NWjs (webRoot: chosen experimentation)",
             "type": "nwjs",
             "request": "launch",
             "nwjsVersion": "any",
-            "webRoot": "${workspaceFolder}/experimentation",
+            "webRoot": "${workspaceFolder}/${input:experimentationFolder}",
             "reloadAfterAttached": true,
             "preLaunchTask": "copy-files-and-install"
         },
         {
-            "name": "NWjs (webRoot: experimentation/www)",
+            "name": "NWjs (webRoot: chosen experimentation/www)",
             "type": "nwjs",
             "request": "launch",
             "nwjsVersion": "any",
-            "webRoot": "${workspaceFolder}/experimentation/www",
+            "webRoot": "${workspaceFolder}/${input:experimentationFolder}/www",
             "reloadAfterAttached": true,
             "preLaunchTask": "copy-files-and-install"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "experimentationFolder",
+            "type": "pickString",
+            "description": "Select which experimentation folder to use while debugging.",
+            "options": [
+                "experimentation_c",
+                "experimentation_t",
+                "experimentation"
+            ],
+            "default": "experimentation"
         }
     ]
 }
