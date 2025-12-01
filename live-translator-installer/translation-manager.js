@@ -30,7 +30,7 @@
         const dbg = typeof options?.dbg === 'function' ? options.dbg : noop;
         const state = {
             baseIntervalMs: 250,
-            maxIntervalMs: 5000,
+            maxIntervalMs: 8000,
             intervalMs: 0,
             cooldownUntil: 0,
             lastRunAt: 0,
@@ -42,40 +42,63 @@
             return new Promise((resolve) => setTimeout(resolve, ms));
         }
 
+        function is429(err) {
+            return err && (err.status === 429 || /\b429\b/.test(String(err && err.message)));
+        }
+
+        function parseRetryAfter(err) {
+            try {
+                const val = err && typeof err.retryAfter !== 'undefined' ? Number(err.retryAfter) : NaN;
+                if (Number.isFinite(val) && val > 0) {
+                    return Math.max(0, Math.floor(val * 1000));
+                }
+            } catch (_) {}
+            return null;
+        }
+
+        function computeBackoffMs(err, backoffIndex) {
+            const retryAfterMs = parseRetryAfter(err);
+            if (retryAfterMs !== null) return Math.min(state.maxIntervalMs, retryAfterMs);
+            const schedule = [1000, 2000, 4000, 8000];
+            const idx = Math.min(backoffIndex, schedule.length - 1);
+            return Math.min(state.maxIntervalMs, schedule[idx]);
+        }
+
         async function processQueue() {
             if (state.running) return;
             state.running = true;
             try {
                 while (state.queue.length) {
                     const { task, resolve, reject } = state.queue.shift();
-                    const now = Date.now();
-                    const timeSinceLast = now - (state.lastRunAt || 0);
-                    const waitForInterval = Math.max(0, state.intervalMs - timeSinceLast);
-                    const waitForCooldown = Math.max(0, state.cooldownUntil - now);
-                    const waitMs = Math.max(waitForInterval, waitForCooldown);
-                    if (waitMs > 0) await sleep(waitMs);
-                    try {
-                        state.lastRunAt = Date.now();
-                        const res = await task();
-                        if (state.intervalMs === 0) state.intervalMs = state.baseIntervalMs;
-                        else state.intervalMs = Math.max(state.baseIntervalMs, Math.floor(state.intervalMs * 0.75));
-                        state.cooldownUntil = 0;
-                        resolve(res);
-                    } catch (err) {
+                    let backoffIndex = 0;
+                    let attempt = 0;
+                    while (true) {
+                        attempt += 1;
+                        const now = Date.now();
+                        const timeSinceLast = now - (state.lastRunAt || 0);
+                        const waitForInterval = Math.max(0, state.intervalMs - timeSinceLast);
+                        const waitForCooldown = Math.max(0, state.cooldownUntil - now);
+                        const waitMs = Math.max(waitForInterval, waitForCooldown);
+                        if (waitMs > 0) await sleep(waitMs);
                         try {
-                            const is429 = (err && (err.status === 429 || /\b429\b/.test(String(err && err.message))));
-                            if (is429) {
-                                const retryAfterSec = (err && typeof err.retryAfter !== 'undefined') ? Number(err.retryAfter) : NaN;
-                                const retryMs = !Number.isNaN(retryAfterSec) && retryAfterSec > 0
-                                    ? Math.min(state.maxIntervalMs, Math.floor(retryAfterSec * 1000))
-                                    : Math.min(state.maxIntervalMs, state.intervalMs ? state.intervalMs * 2 : 1000);
-                                const jitter = Math.floor(Math.random() * 250);
-                                state.intervalMs = Math.max(state.baseIntervalMs, retryMs);
-                                state.cooldownUntil = Date.now() + state.intervalMs + jitter;
-                                dbg(`[Translate] 429 received. Backing off ~${state.intervalMs}ms`);
-                            }
-                        } catch (_) {}
-                        reject(err);
+                            state.lastRunAt = Date.now();
+                            const res = await task();
+                            if (state.intervalMs === 0) state.intervalMs = state.baseIntervalMs;
+                            else state.intervalMs = Math.max(state.baseIntervalMs, Math.floor(state.intervalMs * 0.75));
+                            state.cooldownUntil = 0;
+                            resolve(res);
+                            break;
+                        } catch (err) {
+                            const backoffMs = computeBackoffMs(err, backoffIndex);
+                            if (backoffIndex < 3) backoffIndex += 1;
+                            const jitter = Math.floor(Math.random() * 250);
+                            const totalWait = backoffMs + jitter;
+                            state.intervalMs = Math.max(state.baseIntervalMs, backoffMs);
+                            state.cooldownUntil = Date.now() + totalWait;
+                            const tag = is429(err) ? '429' : 'retryable error';
+                            dbg(`[Translate] ${tag} (attempt ${attempt}). Backing off ~${totalWait}ms`);
+                            await sleep(totalWait);
+                        }
                     }
                 }
             } finally {
@@ -111,7 +134,8 @@
             : null;
 
         const state = { queue: [], running: false };
-        const MAX_BATCH_CHARS = 100;
+        const MAX_BATCH_CHARS = 1800;
+        const MAX_BATCH_ITEMS = 49;
 
         function takeNextBatch() {
             if (!state.queue.length) return null;
@@ -125,6 +149,7 @@
                     items.push(state.queue.shift());
                     chars += len;
                 } else {
+                    if (items.length >= MAX_BATCH_ITEMS) break;
                     if (chars + len > MAX_BATCH_CHARS) break;
                     items.push(state.queue.shift());
                     chars += len;
@@ -171,9 +196,9 @@
                             items[i].resolve(out);
                         }
                     } catch (err) {
-                        for (const item of items) {
-                            try { item.reject(err); } catch (_) {}
-                        }
+                        diag('[TranslatorBatcher] remote failure; requeueing batch for retry');
+                        // Push items back to the front of the queue for another attempt
+                        state.queue = items.concat(state.queue);
                     }
                 }
             } catch (err) {

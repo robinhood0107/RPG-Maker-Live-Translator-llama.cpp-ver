@@ -14,7 +14,9 @@
         },
         "deepl": {
             "language": "KO",
-            "apiKey": null
+            "apiKey": "________NONE________",
+            "maxBatchItems": 49,
+            "batchCharLimit": 2000
         }
     }
 }

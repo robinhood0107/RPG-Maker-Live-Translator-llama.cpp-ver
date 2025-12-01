@@ -100,7 +100,7 @@ try {
 
     # Check if the plugin entry already exists in plugins.js
     if (Test-Path $pluginsFile) {
-        $pluginsContent = Get-Content $pluginsFile -Raw
+        $pluginsContent = Get-Content $pluginsFile -Raw -Encoding UTF8
         if ($pluginsContent -match "live-translator-loader") {
             Write-Host "Plugin entry already exists in $pluginsFile" -ForegroundColor Yellow
         } else {

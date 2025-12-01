@@ -8,18 +8,28 @@
         // Unified translator function (DeepL or Local LLM based on config)
         async translateText(text, targetLang = null) {
             try {
-                // For local LLM, call the single-item path directly (no translateMany)
+                const [first] = await TextProcessor.translateMany([text], targetLang);
+                return typeof first === 'string' ? first : '';
+            } catch (error) {
+                console.error('Translation error:', error);
+                throw error;
+            }
+        },
+
+        async translateMany(texts, targetLang = null) {
+            const items = Array.isArray(texts) ? texts : [texts];
+            try {
+                // For local LLM, map single-item path directly
                 if (TRANSLATOR_CONFIG.provider === 'local') {
-                    return await translateOneLocal(String(text), TRANSLATOR_CONFIG.settings.local);
+                    return Promise.all(items.map((t) => translateOneLocal(String(t), TRANSLATOR_CONFIG.settings.local)));
                 }
 
-                // Otherwise, use batch path for providers that support it
-                const out = await translateManyDeepL(
-                    [String(text)],
+                // DeepL batch path (preferred)
+                return await translateManyDeepL(
+                    items.map((t) => String(t)),
                     resolveTargetLang(targetLang),
                     resolveDeepLKey()
                 );
-                return out && out.length ? out[0] : '';
             } catch (error) {
                 console.error('Translation error:', error);
                 throw error;
