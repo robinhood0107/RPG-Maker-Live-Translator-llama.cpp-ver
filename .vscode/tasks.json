@@ -36,6 +36,7 @@
             "options": [
                 "experimentation_c",
                 "experimentation_t",
+                "experimentation_h",
                 "experimentation"
             ],
             "default": "experimentation"

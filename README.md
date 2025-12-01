@@ -26,6 +26,9 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 3. Inspect `package.json` and make sure `name` field is not empty.
 4. Go to `js/plugins/` or `www/js/plugins` to edit `live-translator-installer/translator.json`. For DeepL, set `"provider": "deepl"`, configure `settings.deepl.language`, and paste your API key into `settings.deepl.apiKey`. To use a OpenAI compatible API (like LM Studio), set `"provider": "local"` and modify the prompt. The files in the `installer` folder are not active!
 
+## Troubleshooting
+View `diagnostics.log`.
+
 ## Dev Environment and Troubleshooting (Recommended):
 1. Install `nwjs debugger for VSCode` plugin - https://marketplace.visualstudio.com/items?itemName=ruakr.vsc-nwjs
 2. Put the game inside `experimentation/` folder.
@@ -36,4 +39,7 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 1.0 - major refactor - performance and accuracy improvements, etc
 
 1.1 - fix DeepL 429, fix installer messing up `plugins.json` encoding
+
+1.2 - Most errors should be visible in `diagnostics.log`
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

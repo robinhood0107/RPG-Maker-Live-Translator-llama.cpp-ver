@@ -3,6 +3,20 @@
     'use strict';
 
     const TRANSLATOR_CONFIG = initializeTranslatorConfig();
+    const logger = (() => {
+        try {
+            if (typeof globalThis !== 'undefined'
+                && globalThis.LiveTranslatorModules
+                && typeof globalThis.LiveTranslatorModules.createLoggerBundle === 'function') {
+                const bundle = globalThis.LiveTranslatorModules.createLoggerBundle({
+                    settings: (typeof globalThis.LiveTranslatorSettings === 'object' && globalThis.LiveTranslatorSettings) || {},
+                    maxLogsPerFrame: 1000,
+                });
+                return bundle && bundle.logger ? bundle.logger : console;
+            }
+        } catch (_) {}
+        return console;
+    })();
 
     const TextProcessor = {
         // Unified translator function (DeepL or Local LLM based on config)
@@ -11,7 +25,7 @@
                 const [first] = await TextProcessor.translateMany([text], targetLang);
                 return typeof first === 'string' ? first : '';
             } catch (error) {
-                console.error('Translation error:', error);
+                logger.error('Translation error:', error);
                 throw error;
             }
         },
@@ -31,7 +45,7 @@
                     resolveDeepLKey()
                 );
             } catch (error) {
-                console.error('Translation error:', error);
+                logger.error('Translation error:', error);
                 throw error;
             }
         },

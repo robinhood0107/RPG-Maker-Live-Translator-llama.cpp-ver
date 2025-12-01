@@ -105,7 +105,11 @@
             return null;
         })();
         if (disabledReason) {
-            log.error('[DiskCache] Disabled:', disabledReason);
+            if (typeof log.info === 'function') {
+                log.info('[DiskCache] Disabled:', disabledReason);
+            } else {
+                log.error('[DiskCache] Disabled:', disabledReason);
+            }
         }
         const enabled = !disabledReason;
         const file = enabled ? path.join(dir, 'translation-cache.log') : null;
@@ -126,7 +130,7 @@
 
         const ensureDir = async () => {
             if (!enabled) return;
-            try { await fs.promises.mkdir(dir, { recursive: true }); } catch (_) {}
+            await fs.promises.mkdir(dir, { recursive: true });
         };
 
         const rewriteAll = async () => {
@@ -160,7 +164,7 @@
                 data = await fs.promises.readFile(file, 'utf8');
             } catch (err) {
                 if (err && err.code !== 'ENOENT') {
-                    log.error('[DiskCache Read Error]', err);
+                    throw err;
                 }
                 return;
             }
@@ -173,7 +177,7 @@
                 totalBytes += rec.size;
             }
             if (trimToLimit()) {
-                try { await rewriteAll(); } catch (err) { log.error('[DiskCache Rewrite Error]', err); }
+                await rewriteAll();
             }
         };
 
