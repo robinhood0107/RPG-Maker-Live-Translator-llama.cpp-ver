@@ -19,25 +19,20 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 1. Download all files (excluding .vscode files) and unzip to the game folder.
 2. Create apikey.txt containing your DeepL API key.
 3. Right-click `installer.ps1` → `Run with PowerShell`. If blocked, open up powershell console and `Set-ExecutionPolicy -Scope Process Bypass`. If you're confused, ask ChatGPT to guide you through with executing a `ps1` powershell script.
-4. Open up translator.js with your notepad and change `SETTINGS.translation.targetLang` (such as EN).
+4. Open up translator.js with notepad or vscode and change `SETTINGS.translation.targetLang` (such as EN).
 
 ## Instructions (Manual):
 1. Copy `text-replacement-addon.js` to `js/plugins/` folder and add an entry to `plugins.js` file.
 2. Inspect `package.json` and make sure `name` field is not empty.
 3. Open up translator.js with your notepad and change `SETTINGS.translation.targetLang` to the language of your choice (like `EN`).
 
-## Translation Providers
-
-- DeepL: default when `apikey.txt` is present. Change the endpoint to `api.deepl.com` if you're a paid user.
-- Local LLM (LM Studio): enabled when `apikey.txt` is missing or when you explicitly pass `"local"` as the API key to `translateText/translateMany`.
-
-### Local LLM Setup (LM Studio)
+## Local LLM Setup (LM Studio)
 1. Run LM Studio Local Inference Server (OpenAI-compatible) on your machine.
 2. Create `local.json` next to `translator.js` with settings:
    {
      "address": "127.0.0.1",
      "port": 1234,
-     "model": "<your_model_name>",
+     "model": "yanoljanext-rosetta-27b-2511-i1",
      "system_prompt": "You are a translation engine.",
      "temperature": 0.2,
      "top_k": 40,
@@ -45,11 +40,6 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
      "min_p": 0.05,
      "top_p": 0.95
    }
-3. Remove `apikey.txt` (or set the API key argument to `local`) to route translations to your local server.
-
-Notes:
-- The translator calls `POST http://<address>:<port>/v1/chat/completions` with the above parameters and parses `choices[0].message.content`.
-- Batch translations are executed sequentially against the local server to preserve ordering.
 
 ## Dev Environment and Troubleshooting:
 1. Install `nwjs debugger for VSCode` plugin - https://marketplace.visualstudio.com/items?itemName=ruakr.vsc-nwjs
@@ -58,13 +48,6 @@ Notes:
 4. Open up your vibecodingpromasterTM software of your choice because surely you're not manually debugging this 2000 line jank like what, some kind of a caveman.
 
 ## Changelog
-#### 0.2
-Try to mitigate occasional overlapping text draws
+0.2 - Try to mitigate occasional overlapping text draws
 
-#### 0.3
-Fixed overlapping text and broken layout when translation cache is not available.
-
-Added LLM translation option.
-
----
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

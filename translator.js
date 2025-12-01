@@ -4,7 +4,7 @@
 
     // Hardcoded translation config
     const TRANSLATOR_CONFIG = {
-        provider: 'deepl', // 'deepl' | 'local'
+        provider: 'local', // 'deepl' | 'local'
         targetLang: 'KO',
         enableTokenCounter: true // crude cumulative token accounting (Qwen-style heuristic)
     };

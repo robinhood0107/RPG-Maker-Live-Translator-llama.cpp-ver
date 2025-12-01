@@ -8,7 +8,7 @@
     // Basic settings and debug gates
     const SETTINGS = {
         logging: {
-            enabled: false,         // master switch for console/log outputs
+            enabled: true,         // master switch for console/log outputs
             suppressExact: [
             ],
         },
@@ -28,7 +28,7 @@
         },
         diskCache: {
             maxEntries: 0,         // 0 = ~2.1M entries (~3 GiB); override to cap/extend retention
-            clearOnLaunch: false,   // delete stale entries on startup when limit set
+            clearOnLaunch: true,   // delete stale entries on startup when limit set
         }
     };
 
@@ -615,7 +615,8 @@
             ? SETTINGS.diskCache
             : {};
         const dir = (fs && path) ? resolveCacheDir() : null;
-        const enabled = !!(fs && path && dir && typeof dir === 'string' && isLoggingEnabled() && settings.enabled !== false);
+        // Enable disk cache whenever filesystem is available, independent of console logging
+        const enabled = !!(fs && path && dir && typeof dir === 'string' && settings.enabled !== false);
         const file = enabled ? path.join(dir, 'translation-cache.log') : null;
 
         // Serialize appends to avoid interleaving writes
@@ -719,11 +720,14 @@
         async function prepareOnLaunch() {
             if (!enabled || launchPrepared) return;
             launchPrepared = true;
+            // On launch, either prune to the limit (preferred) or, if explicitly requested,
+            // perform a conservative cleanup that keeps up to maxEntries instead of wiping all.
             if (shouldClearOnLaunch()) {
-                await clearLogFile();
-                return;
+                // Honor clearOnLaunch by pruning old entries rather than deleting everything
+                await pruneToLimit();
+            } else {
+                await pruneToLimit();
             }
-            await pruneToLimit();
         }
 
         async function ensureLaunchPrune() {
@@ -1124,6 +1128,53 @@
         }
     }
 
+    function estimateEntryBounds(window, type, text, x, y, convertedText) {
+        try {
+            const contents = window && window.contents ? window.contents : null;
+            const lh = (() => {
+                if (window && typeof window.lineHeight === 'function') {
+                    return Math.max(1, Math.ceil(window.lineHeight()));
+                }
+                if (contents && typeof contents.fontSize === 'number') {
+                    return Math.max(1, Math.ceil(contents.fontSize));
+                }
+                return 24;
+            })();
+
+            let width = 0;
+            const basis = stripRpgmEscapes(String(convertedText || text || ''));
+
+            try {
+                if (type === 'drawTextEx' && typeof window.textSizeEx === 'function') {
+                    const sz = window.textSizeEx(basis);
+                    width = Math.ceil((sz && sz.width) || 0);
+                } else if (contents && typeof contents.measureTextWidth === 'function') {
+                    width = Math.ceil(contents.measureTextWidth(basis));
+                } else if (typeof window.textWidth === 'function') {
+                    width = Math.ceil(window.textWidth(basis));
+                } else if (contents && typeof contents.textWidth === 'function') {
+                    width = Math.ceil(contents.textWidth(basis));
+                }
+            } catch (_) {}
+
+            if (!width || !Number.isFinite(width)) {
+                const fontSize = contents && typeof contents.fontSize === 'number' ? contents.fontSize : lh;
+                width = Math.ceil(basis.length * Math.max(6, fontSize * 0.6));
+            }
+
+            const x1 = Number.isFinite(Number(x)) ? Number(x) : 0;
+            const y1 = Number.isFinite(Number(y)) ? Number(y) : 0;
+            return {
+                x1,
+                y1,
+                x2: x1 + Math.max(0, width),
+                y2: y1 + lh
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
     function generateKey(type, x, y, windowType = null, text = null) {
         // For choice lists, always include text content to prevent key collisions
         // when multiple items are drawn at same coordinates during layout
@@ -1148,7 +1199,9 @@
         try {
             if (window && window.contents) {
                 contentsOwners.set(window.contents, window);
-                window.contents._trPreferWindowPipeline = true;
+                if (!window.contents._trWindowPipelineDepth) {
+                    window.contents._trWindowPipelineDepth = 0;
+                }
             }
         } catch (_) {}
         // Remove spammy diagnostic - this gets called constantly
@@ -1171,7 +1224,9 @@
         try {
             if (window && window.contents) {
                 contentsOwners.set(window.contents, window);
-                window.contents._trPreferWindowPipeline = true;
+                if (!window.contents._trWindowPipelineDepth) {
+                    window.contents._trWindowPipelineDepth = 0;
+                }
             }
         } catch (_) {}
     }
@@ -1240,7 +1295,14 @@
             timestamp: Date.now(),
             translationSource: translationSource,
             placeholderInfo: placeholderInfo,
+            bounds: null,
         };
+
+        const visibleText = stripRpgmEscapes(convertedText || textToTranslate || text);
+        try {
+            textEntry.bounds = estimateEntryBounds(window, type, textToTranslate, x, y, convertedText || textToTranslate);
+        } catch (_) { /* ignore bound estimation errors */ }
+        textEntry.visibleText = visibleText;
 
         // Prune stale duplicates for same text drawn elsewhere in the same window
         try {
@@ -1466,19 +1528,61 @@
                         clearY = y + yOffset;
                         clearH = hBase;
                     } else if (textEntry.type === 'drawTextEx') {
+                        const baseLineHeight = (() => {
+                            try {
+                                if (typeof targetWindow.lineHeight === 'function') {
+                                    return Math.max(1, Math.ceil(targetWindow.lineHeight()));
+                                }
+                            } catch (_) {}
+                            if (contents && typeof contents.fontSize === 'number') {
+                                return Math.max(1, Math.ceil(contents.fontSize));
+                            }
+                            return 24;
+                        })();
+
                         const sizeFor = (txt) => {
+                            const value = String(txt || '');
                             try {
                                 if (typeof targetWindow.textSizeEx === 'function') {
-                                    const sz = targetWindow.textSizeEx(String(txt));
-                                    return {
-                                        w: Math.ceil(sz.width || 0),
-                                        h: Math.ceil(sz.height || targetWindow.lineHeight())
-                                    };
+                                    const sz = targetWindow.textSizeEx(value);
+                                    if (sz && typeof sz === 'object') {
+                                        const width = Math.ceil(sz.width || 0);
+                                        let height = Math.ceil(sz.height || 0);
+                                        if (!height && typeof sz.lines !== 'undefined') {
+                                            const lines = Math.max(1, Number(sz.lines) || 0);
+                                            height = baseLineHeight * lines;
+                                        }
+                                        if (!height) height = baseLineHeight;
+                                        return { w: width, h: height };
+                                    }
                                 }
                             } catch (e) { /* ignore measure errors */ }
+
+                            const cleaned = stripRpgmEscapes(value);
+                            const parts = cleaned.split(/\r?\n/);
+                            let maxWidth = 0;
+
+                            for (const part of parts) {
+                                let w = 0;
+                                try {
+                                    if (typeof targetWindow.textWidth === 'function') {
+                                        w = Math.ceil(targetWindow.textWidth(part));
+                                    } else if (contents && typeof contents.measureTextWidth === 'function') {
+                                        w = Math.ceil(contents.measureTextWidth(part));
+                                    } else {
+                                        const estimateFont = (contents && typeof contents.fontSize === 'number') ? contents.fontSize : baseLineHeight;
+                                        w = Math.ceil(part.length * estimateFont * 0.6);
+                                    }
+                                } catch (_) {
+                                    const estimateFont = (contents && typeof contents.fontSize === 'number') ? contents.fontSize : baseLineHeight;
+                                    w = Math.ceil(part.length * estimateFont * 0.6);
+                                }
+                                if (w > maxWidth) maxWidth = w;
+                            }
+
                             return {
-                                w: Math.ceil(targetWindow.textWidth(String(txt))),
-                                h: targetWindow.lineHeight()
+                                w: Math.max(0, maxWidth),
+                                h: baseLineHeight * Math.max(1, parts.length)
                             };
                         };
 
@@ -1624,15 +1728,36 @@
                         if (this._trSessionId === pending.sessionId) {
                             try { this.contents.clear(); } catch (e) {}
                             if (typeof this.resetFontSettings === 'function') this.resetFontSettings();
-                            let startX = 0;
                             try {
-                                if (typeof this.newLineX === 'function') startX = this.newLineX();
-                                else if (typeof this.textPadding === 'function') startX = this.textPadding();
-                            } catch (e) { startX = (typeof this.textPadding === 'function') ? this.textPadding() : 0; }
+                                if (typeof this.drawMessageFace === 'function' && $gameMessage && typeof $gameMessage.faceName === 'function' && $gameMessage.faceName()) {
+                                    this.drawMessageFace();
+                                }
+                            } catch (_) {}
+                            // Prefer previously captured coordinates, then current textState, then fallbacks
+                            let startX = (pending && typeof pending.x === 'number') ? pending.x : ((typeof this._trMsgStartX === 'number') ? this._trMsgStartX : 0);
+                            let startY = (pending && typeof pending.y === 'number') ? pending.y : ((typeof this._trMsgStartY === 'number') ? this._trMsgStartY : 0);
+                            try {
+                                if (typeof startX !== 'number' || isNaN(startX)) startX = 0;
+                                if (typeof startY !== 'number' || isNaN(startY)) startY = 0;
+                                // If textState exists, it holds correct offsets (face/namebox/etc.)
+                                if (this._textState) {
+                                    if (typeof this._textState.startX === 'number') startX = this._textState.startX;
+                                    else if (typeof this._textState.x === 'number') startX = this._textState.x;
+                                    if (typeof this._textState.y === 'number') startY = this._textState.y;
+                                }
+                                // Still no X? Ask window for its computed starting X
+                                if (startX === 0) {
+                                    if (typeof this.newLineX === 'function') startX = this.newLineX(this._textState || undefined);
+                                    else if (typeof this.textPadding === 'function') startX = this.textPadding();
+                                }
+                            } catch (e) {
+                                startX = (typeof this.textPadding === 'function') ? this.textPadding() : 0;
+                                startY = 0;
+                            }
                             const signed = REDRAW_SIGNATURE + pending.text;
                             this._trBypassProcessCharacter = (this._trBypassProcessCharacter || 0) + 1;
                             try {
-                                this.drawTextEx(signed, startX, 0);
+                                this.drawTextEx(signed, startX, startY);
                                 if (this._textState) this._textState.index = this._textState.text.length;
                                 this._showFast = true;
                                 this._lineShowFast = true;
@@ -1659,17 +1784,34 @@
         logger.trace('[HOOK INSTALL] Original drawText saved:', typeof originalDrawText);
 
         Window_Base.prototype.drawText = function (text, x, y, maxWidth, align) {
-            // Convert text to string if it isn't already (numbers, etc.)
             const textStr = String(text);
-            
-            // Check if this is our own redraw - if so, skip tracking and strip signature
+            const contents = this && this.contents ? this.contents : null;
+
+            const invokeOriginal = (overrideText) => {
+                const value = (overrideText !== undefined) ? overrideText : text;
+                if (!contents) {
+                    return originalDrawText.call(this, value, x, y, maxWidth, align);
+                }
+                contents._trPreferWindowPipeline = true;
+                contents._trWindowPipelineDepth = (contents._trWindowPipelineDepth || 0) + 1;
+                contents._trAggregationDepth = (contents._trAggregationDepth || 0) + 1;
+                try {
+                    return originalDrawText.call(this, value, x, y, maxWidth, align);
+                } finally {
+                    contents._trWindowPipelineDepth = Math.max(0, (contents._trWindowPipelineDepth || 1) - 1);
+                    contents._trAggregationDepth = Math.max(0, (contents._trAggregationDepth || 1) - 1);
+                    if (contents._trAggregationDepth === 0 && typeof contents._trFlushAggregatedLines === 'function') {
+                        contents._trFlushAggregatedLines();
+                    }
+                }
+            };
+
             if (textStr.startsWith(REDRAW_SIGNATURE)) {
                 const cleanText = textStr.substring(REDRAW_SIGNATURE.length);
                 diagnostics.logDraw('bypass', cleanText, x, y, { windowType: this.constructor.name });
-                return originalDrawText.call(this, cleanText, x, y, maxWidth, align);
+                return invokeOriginal(cleanText);
             }
 
-            // Early skip for trivial counters to reduce noise
             const trimmed = textStr.trim();
             const nonSpace = trimmed.replace(/\s+/g, '');
             const cjkMatch = trimmed.match(/[\u3040-\u30FF\u4E00-\u9FFF]/g);
@@ -1679,24 +1821,24 @@
             const looksLikeCounter = (
                 hasDigit && (cjkCount <= 1) && nonSpace.length <= 10
             ) || onlyNumPunct || /\d+\s*[\u3040-\u30FF\u4E00-\u9FFF]\s*\(\d+\)/u.test(trimmed);
-            ensureWindowRegistered(this);
-            let windowData = windowRegistry.get(this);
 
-            // If this is a duplicate of the last seen at this slot, avoid logging/queueing
+            ensureWindowRegistered(this);
+            const windowData = windowRegistry.get(this);
+
             if (trimmed) {
                 const dupKey = generateKey('drawText', x, y, windowData.windowType, trimmed);
                 const existing = windowData.texts.get(dupKey);
                 if (existing && existing.rawText === textStr && existing.convertedText === trimmed) {
-                    // If we already have a completed translation, opportunistically redraw
                     if (existing.translationStatus === 'completed' && existing.translatedText) {
-                        try { redrawTranslatedText(existing, windowData); } catch (_) {}
+                        const signed = REDRAW_SIGNATURE + existing.translatedText;
+                        return invokeOriginal(signed);
                     }
-                    return originalDrawText.call(this, text, x, y, maxWidth, align);
+                    return invokeOriginal();
                 }
             }
 
             if (!trimmed || looksLikeCounter || translationCache.shouldSkip(trimmed)) {
-                return originalDrawText.call(this, text, x, y, maxWidth, align);
+                return invokeOriginal();
             }
 
             // Log original text being drawn
@@ -1718,16 +1860,15 @@
                     const key = generateKey('drawText', x, y, windowData.windowType, trimmed);
                     const rr = windowData.recentlyRedrawn && windowData.recentlyRedrawn.get ? windowData.recentlyRedrawn.get(key) : null;
                     if (rr && Date.now() - rr < 200) {
-                        // Recently redrawn by us; avoid immediate duplicate inline draw
-                        return originalDrawText.call(this, textStr, x, y, maxWidth, align);
+                        return invokeOriginal(textStr);
                     }
                     // Skip replacement if original and translated text are the same
                     if (norm === translated) {
                         dbg(`[DrawText Skip] Original and translated text are identical: "${preview(norm)}"`);
-                        return originalDrawText.call(this, textStr, x, y, maxWidth, align);
+                        return invokeOriginal();
                     }
                     const signed = REDRAW_SIGNATURE + translated;
-                    return originalDrawText.call(this, signed, x, y, maxWidth, align);
+                    return invokeOriginal(signed);
                 }
             } catch (_) {}
             // If translation exists in our entry (e.g., after reopen), apply via redraw
@@ -1735,36 +1876,53 @@
                 const key = generateKey('drawText', x, y, windowData.windowType, trimmed);
                 const entry = windowData.texts.get(key);
                 if (entry && entry.translationStatus === 'completed' && entry.translatedText) {
-                    redrawTranslatedText(entry, windowData);
+                    const signed = REDRAW_SIGNATURE + entry.translatedText;
+                    return invokeOriginal(signed);
                 }
             } catch (_) {}
             // Remove expensive diagnostic call from every draw
             // showTextDiagnostics();
 
-            return originalDrawText.call(this, text, x, y, maxWidth, align);
+            return invokeOriginal();
         };
 
         // DrawTextEx
         const originalDrawTextEx = Window_Base.prototype.drawTextEx;
 
         Window_Base.prototype.drawTextEx = function (text, x, y) {
-            // Convert text to string if it isn't already (numbers, etc.)
             const textStr = String(text);
-            
-            // Check if this is our own redraw - if so, skip tracking and strip signature
+            const contents = this && this.contents ? this.contents : null;
+
+            const invokeOriginal = (overrideText) => {
+                const value = (overrideText !== undefined) ? overrideText : text;
+                if (!contents) {
+                    return originalDrawTextEx.call(this, value, x, y);
+                }
+                contents._trPreferWindowPipeline = true;
+                contents._trWindowPipelineDepth = (contents._trWindowPipelineDepth || 0) + 1;
+                contents._trAggregationDepth = (contents._trAggregationDepth || 0) + 1;
+                try {
+                    return originalDrawTextEx.call(this, value, x, y);
+                } finally {
+                    contents._trWindowPipelineDepth = Math.max(0, (contents._trWindowPipelineDepth || 1) - 1);
+                    contents._trAggregationDepth = Math.max(0, (contents._trAggregationDepth || 1) - 1);
+                    if (contents._trAggregationDepth === 0 && typeof contents._trFlushAggregatedLines === 'function') {
+                        contents._trFlushAggregatedLines();
+                    }
+                }
+            };
+
             if (textStr.startsWith(REDRAW_SIGNATURE)) {
                 const cleanText = textStr.substring(REDRAW_SIGNATURE.length);
                 diagnostics.logDraw('bypass', cleanText, x, y, { windowType: this.constructor.name });
-                // Set a re-entrancy bypass so createTextState doesn't re-trigger translation
                 this._trBypassCreateTextState = (this._trBypassCreateTextState || 0) + 1;
                 try {
-                    return originalDrawTextEx.call(this, cleanText, x, y);
+                    return invokeOriginal(cleanText);
                 } finally {
                     this._trBypassCreateTextState = Math.max(0, (this._trBypassCreateTextState || 1) - 1);
                 }
             }
 
-            // Early skip for trivial counters to reduce noise
             const trimmed = textStr.trim();
             const nonSpace = trimmed.replace(/\s+/g, '');
             const cjkMatch = trimmed.match(/[\u3040-\u30FF\u4E00-\u9FFF]/g);
@@ -1774,39 +1932,48 @@
             const looksLikeCounter = (
                 hasDigit && (cjkCount <= 1) && nonSpace.length <= 10
             ) || onlyNumPunct || /\d+\s*[\u3040-\u30FF\u4E00-\u9FFF]\s*\(\d+\)/u.test(trimmed);
-            ensureWindowRegistered(this);
-            let windowData = windowRegistry.get(this);
 
-            // If duplicate at this slot, avoid re-logging/queueing
+            ensureWindowRegistered(this);
+            const windowData = windowRegistry.get(this);
+
+            // For Window_Message (and subclasses), capture engine-computed starting coordinates once per session
+            try {
+                if (this && this.constructor && (this.constructor.name === 'Window_Message' || this.constructor.name === 'Window_Message_Battle')) {
+                    const sess = this._trMessageSession || this._trSessionId || 0;
+                    if (sess && this._trMsgStartSession !== sess) {
+                        this._trMsgStartX = x;
+                        this._trMsgStartY = y;
+                        this._trMsgStartSession = sess;
+                    }
+                }
+            } catch (_) {}
+
             if (trimmed) {
                 const dupKey = generateKey('drawTextEx', x, y, windowData.windowType, trimmed);
                 const existing = windowData.texts.get(dupKey);
                 if (existing && existing.rawText === textStr && existing.convertedText === trimmed) {
                     if (existing.translationStatus === 'completed' && existing.translatedText) {
-                        try { redrawTranslatedText(existing, windowData); } catch (_) {}
+                        const signed = REDRAW_SIGNATURE + existing.translatedText;
+                        return invokeOriginal(signed);
                     }
-                    return originalDrawTextEx.call(this, text, x, y);
+                    return invokeOriginal();
                 }
             }
 
             if (!trimmed || looksLikeCounter || translationCache.shouldSkip(trimmed)) {
-                return originalDrawTextEx.call(this, text, x, y);
+                return invokeOriginal();
             }
 
-            // Log original text being drawn
-            diagnostics.logDraw('original', trimmed, x, y, { 
+            diagnostics.logDraw('original', trimmed, x, y, {
                 windowType: this.constructor.name,
                 method: 'drawTextEx'
             });
 
-            // Convert escape characters to get the final display text
             const convertedText = this.convertEscapeCharacters(trimmed);
-            // Prepare a control-code-free string for translation/cache lookups
             const prep = prepareTextForTranslation(convertedText);
-            // DrawTextEx doesn't have additional parameters like maxWidth/align
             const originalParams = {};
             addTextToWindowData(this, windowData, trimmed, x, y, "drawTextEx", convertedText, originalParams);
-            // If translation already cached (using control-code-free text), draw translated inline
+
             try {
                 const norm = String(prep.textForTranslation || trimmed).trim();
                 if (translationCache.completed.has(norm)) {
@@ -1815,30 +1982,27 @@
                     const key = generateKey('drawTextEx', x, y, windowData.windowType, convertedText || trimmed);
                     const rr = windowData.recentlyRedrawn && windowData.recentlyRedrawn.get ? windowData.recentlyRedrawn.get(key) : null;
                     if (rr && Date.now() - rr < 200) {
-                        // Recently redrawn by us; avoid immediate duplicate inline draw
-                        return originalDrawTextEx.call(this, textStr, x, y);
+                        return invokeOriginal(textStr);
                     }
-                    // Skip replacement if original and translated text are the same
                     if (convertedText === restored) {
                         dbg(`[DrawTextEx Skip] Original and translated text are identical: "${preview(norm)}"`);
-                        return originalDrawTextEx.call(this, textStr, x, y);
+                        return invokeOriginal();
                     }
                     const signed = REDRAW_SIGNATURE + restored;
-                    return originalDrawTextEx.call(this, signed, x, y);
+                    return invokeOriginal(signed);
                 }
             } catch (_) {}
-            // If translation exists in our entry (e.g., after reopen), apply via redraw
+
             try {
                 const key = generateKey('drawTextEx', x, y, windowData.windowType, convertedText || trimmed);
                 const entry = windowData.texts.get(key);
                 if (entry && entry.translationStatus === 'completed' && entry.translatedText) {
-                    redrawTranslatedText(entry, windowData);
+                    const signed = REDRAW_SIGNATURE + entry.translatedText;
+                    return invokeOriginal(signed);
                 }
             } catch (_) {}
-            // Remove expensive diagnostic call from every draw
-            // showTextDiagnostics();
 
-            return originalDrawTextEx.call(this, text, x, y);
+            return invokeOriginal();
         };
         
         logger.info('[HOOK INSTALL] drawText and drawTextEx hooks installed successfully');
@@ -1923,6 +2087,8 @@
         // Prefer hooking startMessage to get full resolved text once
         const originalStartMessage = Window_Message.prototype.startMessage;
         Window_Message.prototype.startMessage = function() {
+            // First, let the game (and plugins) initialize textState and layout
+            const res = originalStartMessage.call(this);
             try {
                 // Begin a new session
                 gameMessageState.session++;
@@ -1931,6 +2097,15 @@
                 this._trMessageSession = gameMessageState.session;
                 this._trStartedThisSession = true;
                 this._trSentTranslateThisSession = false;
+
+                // Capture engine/plugin-computed baseline coordinates for redraw
+                try {
+                    if (this && this._textState) {
+                        if (typeof this._textState.startX === 'number') this._trMsgStartX = this._textState.startX; // includes plugin offsets
+                        else if (typeof this._textState.x === 'number') this._trMsgStartX = this._textState.x;
+                        if (typeof this._textState.y === 'number') this._trMsgStartY = this._textState.y;
+                    }
+                } catch (_) {}
 
                 // Resolve message into final renderable string then strip control codes
                 const rawAll = $gameMessage && $gameMessage.allText ? $gameMessage.allText() : '';
@@ -1948,7 +2123,7 @@
                     }
                 }
             } catch (e) { logger.warn('[GameMessage startMessage hook error]', e); }
-            return originalStartMessage.call(this);
+            return res;
         };
 
         // Hook Window_Message.prototype.processCharacter only as a fallback
@@ -2029,31 +2204,60 @@
                     // Clear and redraw with translation, or queue until window is ready
                     const ready = this.contents && this.visible && this.isOpen();
                     if (!ready) {
-                        this._trPendingRedraw = { text: translated, sessionId };
+                        // Capture coordinates if available now to reuse later
+                        let px = (typeof this._trMsgStartX === 'number') ? this._trMsgStartX : 0;
+                        let py = (typeof this._trMsgStartY === 'number') ? this._trMsgStartY : 0;
+                        try {
+                            if (!px && this._textState) {
+                                if (typeof this._textState.startX === 'number') px = this._textState.startX;
+                                else if (typeof this._textState.x === 'number') px = this._textState.x;
+                                if (typeof this._textState.y === 'number') py = this._textState.y;
+                            } else if (typeof this.newLineX === 'function') {
+                                px = this.newLineX(this._textState || undefined);
+                            } else if (typeof this.textPadding === 'function') {
+                                px = this.textPadding();
+                            }
+                        } catch (_) {}
+                        this._trPendingRedraw = { text: translated, sessionId, x: px, y: py };
                         return;
                     }
 
                     try { this.contents.clear(); } catch (e) {}
                     if (typeof this.resetFontSettings === 'function') this.resetFontSettings();
-
-                    let startX = 0;
                     try {
-                        if (typeof this.newLineX === 'function') {
-                            startX = this.newLineX();
-                        } else if (typeof this.textPadding === 'function') {
-                            startX = this.textPadding();
+                        if (typeof this.drawMessageFace === 'function' && $gameMessage && typeof $gameMessage.faceName === 'function' && $gameMessage.faceName()) {
+                            this.drawMessageFace();
+                        }
+                    } catch (_) {}
+
+                    // Determine starting coordinates: prefer current textState
+                    let startX = (typeof this._trMsgStartX === 'number') ? this._trMsgStartX : 0;
+                    let startY = (typeof this._trMsgStartY === 'number') ? this._trMsgStartY : 0;
+                    try {
+                        if ((!startX || !startY) && this._textState) {
+                            if (typeof this._textState.startX === 'number') startX = this._textState.startX;
+                            else if (typeof this._textState.x === 'number') startX = this._textState.x;
+                            if (typeof this._textState.y === 'number') startY = this._textState.y;
+                        }
+                        if (startX === 0) {
+                            if (typeof this.newLineX === 'function') {
+                                startX = this.newLineX(this._textState || undefined);
+                            } else if (typeof this.textPadding === 'function') {
+                                startX = this.textPadding();
+                            }
                         }
                     } catch (e) {
-                        // Fallback if newLineX() fails due to uninitialized state
-                        logger.warn('[GameMessage] newLineX() failed, using fallback:', e);
+                        // Fallback if newLineX(this._textState || undefined) fails due to uninitialized state
+                        logger.warn('[GameMessage] newLineX(this._textState || undefined) failed, using fallback:', e);
                         startX = (typeof this.textPadding === 'function') ? this.textPadding() : 0;
+                        startY = 0;
                     }
 
                     // Use signature to prevent re-processing
-                        const signed = REDRAW_SIGNATURE + translated;
-                        this._trBypassProcessCharacter = (this._trBypassProcessCharacter || 0) + 1;
-                        try {
-                            this.drawTextEx(signed, startX, 0);
+                    const signed = REDRAW_SIGNATURE + translated;
+                    this._trBypassProcessCharacter = (this._trBypassProcessCharacter || 0) + 1;
+                    try {
+                        this.drawTextEx(signed, startX, startY);
                         // Force completion
                         if (this._textState) {
                             this._textState.index = this._textState.text.length;
@@ -2084,6 +2288,9 @@
                 if (wm) {
                     wm._trStartedThisSession = false;
                     wm._trSentTranslateThisSession = false;
+                    wm._trMsgStartSession = null;
+                    wm._trMsgStartX = undefined;
+                    wm._trMsgStartY = undefined;
                 }
             } catch (_) {}
             
@@ -2321,7 +2528,6 @@
             const aggMap = new WeakMap(); // Bitmap -> { lines: Map<yKey, LineAgg> }
             const Y_TOL = 2; // pixels tolerance to treat as same line
             const JOIN_PAD = 3; // pixels allowed gap/overlap between glyphs
-            const FLUSH_DELAY = 50; // ms to wait for more fragments before translating
             const supMap = new WeakMap(); // Bitmap -> Array<{x1,y1,x2,y2,exp}>
             const fullLineMap = new WeakMap(); // Bitmap -> Map<yKey, { x1, x2, content, exp }>
 
@@ -2333,80 +2539,307 @@
                 return a;
             }
 
-            function scheduleFlush(bitmap, key, line) {
-                if (line.timer) clearTimeout(line.timer);
-                line.timer = setTimeout(() => flushLine(bitmap, key, line), FLUSH_DELAY);
+            function rememberFullLine(bitmap, y, text, x1, x2) {
+                try {
+                    const clean = String(text || '').trim();
+                    if (!clean) return;
+                    const key = yKeyFor(y);
+                    let map = fullLineMap.get(bitmap);
+                    if (!map) { map = new Map(); fullLineMap.set(bitmap, map); }
+                    map.set(key, { x1, x2, content: clean, exp: Date.now() + 300 });
+                } catch (_) { /* ignore record errors */ }
+            }
+
+            const STATE_COMPARE_KEYS = ['textColor', 'outlineColor', 'gradientColor1', 'gradientColor2', 'fontBold', 'fontItalic'];
+
+            function statesDiffer(a, b) {
+                if (!a && !b) return false;
+                if (!a || !b) return true;
+                for (const key of STATE_COMPARE_KEYS) {
+                    if (a[key] !== b[key]) return true;
+                }
+                return false;
             }
 
             function flushLine(bitmap, key, line) {
                 try {
                     if (!line || !line.items || line.items.length === 0) return;
-                    // Order by x and build string
-                    line.items.sort((a,b)=>a.x-b.x);
+                    const owner = contentsOwners.get(bitmap) || null;
+                    line.items.sort((a, b) => a.x - b.x);
                     const text = line.items.map(it => it.text).join('');
                     const norm = text.trim();
-                    if (!norm || translationCache.shouldSkip(norm)) { line.items = []; return; }
+                    if (!norm || translationCache.shouldSkip(norm)) {
+                        line.items = [];
+                        line.baseState = null;
+                        line.multiColor = false;
+                        return;
+                    }
 
                     const minX = line.items[0].x;
                     const maxX = Math.max(...line.items.map(it => it.x + it.w));
                     const width = Math.max(0, maxX - minX);
                     const y = line.y;
                     const h = Math.max(Number(line.lineHeight) || 0, bitmap.fontSize || 24);
-                    const storedState = line.drawState || null;
+                    const storedState = line.baseState || null;
                     const previousState = captureBitmapDrawState(bitmap) || {};
 
-                    // Cache path: immediate substitute
+                    rememberFullLine(bitmap, y, norm, minX, maxX);
+
+                    if (line.multiColor && owner) {
+                        line.items = [];
+                        line.baseState = null;
+                        line.multiColor = false;
+                        return;
+                    }
+
+                    const finishLine = () => {
+                        line.items = [];
+                        line.baseState = null;
+                        line.multiColor = false;
+                    };
+
+                    const restoreState = () => {
+                        try { applyBitmapDrawState(bitmap, previousState); } catch (_) {}
+                        finishLine();
+                    };
+
                     if (translationCache.completed.has(norm)) {
                         const translated = translationCache.completed.get(norm);
                         if (translated && translated !== norm) {
-                            try { bitmap.clearRect(Math.max(0,minX-1), Math.max(0,y-1), width+2, h+2); } catch (_) {}
+                            try { bitmap.clearRect(Math.max(0, minX - 1), Math.max(0, y - 1), width + 2, h + 2); } catch (_) {}
                             const signed = REDRAW_SIGNATURE + translated;
                             try {
                                 if (storedState) applyBitmapDrawState(bitmap, storedState);
                                 const r = original.call(bitmap, signed, minX, y, width, h, 'left');
                                 line.recentFlush = { x1: minX, x2: maxX, t: Date.now() };
-                                // Install suppression rect to ignore overlapping residual fragments briefly
                                 const rects = supMap.get(bitmap) || [];
-                                rects.push({ x1: Math.max(0,minX-1), y1: Math.max(0,y-1), x2: maxX+1, y2: y + Math.max(1,h) - 1, exp: Date.now() + 120, content: String(translated) });
+                                rects.push({ x1: Math.max(0, minX - 1), y1: Math.max(0, y - 1), x2: maxX + 1, y2: y + Math.max(1, h) - 1, exp: Date.now() + 120, content: String(translated) });
                                 supMap.set(bitmap, rects);
+                                rememberFullLine(bitmap, y, translated, minX, maxX);
                                 return r;
                             } finally {
-                                applyBitmapDrawState(bitmap, previousState);
-                                line.items = [];
-                                line.drawState = null;
+                                restoreState();
                             }
                         }
-                        line.items = [];
-                        line.drawState = null;
+                        finishLine();
                         return;
                     }
 
-                    // Async path: draw original now (already drawn), request translation, then clear+redraw when ready
                     translationCache.requestTranslation(norm)
                         .then(translated => {
                             try {
-                                if (!translated || translated === norm) { line.items = []; line.drawState = null; return; }
-                                try { bitmap.clearRect(Math.max(0,minX-1), Math.max(0,y-1), width+2, h+2); } catch (_) {}
+                                if (!translated || translated === norm) {
+                                    finishLine();
+                                    return;
+                                }
+                                try { bitmap.clearRect(Math.max(0, minX - 1), Math.max(0, y - 1), width + 2, h + 2); } catch (_) {}
                                 const signed = REDRAW_SIGNATURE + translated;
                                 if (storedState) applyBitmapDrawState(bitmap, storedState);
                                 original.call(bitmap, signed, minX, y, width, h, 'left');
                                 line.recentFlush = { x1: minX, x2: maxX, t: Date.now() };
                                 const rects = supMap.get(bitmap) || [];
-                                rects.push({ x1: Math.max(0,minX-1), y1: Math.max(0,y-1), x2: maxX+1, y2: y + Math.max(1,h) - 1, exp: Date.now() + 120, content: String(translated) });
+                                rects.push({ x1: Math.max(0, minX - 1), y1: Math.max(0, y - 1), x2: maxX + 1, y2: y + Math.max(1, h) - 1, exp: Date.now() + 120, content: String(translated) });
                                 supMap.set(bitmap, rects);
+                                rememberFullLine(bitmap, y, translated, minX, maxX);
                             } catch (_) {}
                         })
-                        .catch(()=>{})
-                        .finally(()=>{
-                            applyBitmapDrawState(bitmap, previousState);
-                            line.items = [];
-                            line.drawState = null;
+                        .catch(() => {})
+                        .finally(() => {
+                            restoreState();
                         });
                 } catch (_) {
-                    try { line.items = []; line.drawState = null; } catch (_) {}
+                    try {
+                        line.items = [];
+                        line.baseState = null;
+                        line.multiColor = false;
+                    } catch (_) {}
                 }
             }
 
+            function flushAll(bitmap) {
+                try {
+                    const agg = aggMap.get(bitmap);
+                    if (!agg || !agg.lines || agg.lines.size === 0) return;
+                    const entries = Array.from(agg.lines.entries());
+                    for (const [key, line] of entries) {
+                        flushLine(bitmap, key, line);
+                        agg.lines.delete(key);
+                    }
+                } catch (e) {
+                    logger.error('[Bitmap.flushAll Error]', e);
+                }
+            }
+
+            try {
+                Bitmap.prototype._trFlushAggregatedLines = function() {
+                    flushAll(this);
+                };
+            } catch (_) {}
+
+            const WINDOW_Y_TOL = 4;
+
+            function windowPipelineHasEntry(owner, x, y, rawText) {
+                try {
+                    if (!owner) return false;
+                    const windowData = windowRegistry.get(owner);
+                    if (!windowData || !windowData.texts || windowData.texts.size === 0) {
+                        return false;
+                    }
+                    const px = Number.isFinite(Number(x)) ? Number(x) : 0;
+                    const py = Number.isFinite(Number(y)) ? Number(y) : 0;
+                    const trimmed = String(rawText || '').trim();
+                    const candidates = [];
+                    if (trimmed) {
+                        candidates.push(generateKey('drawText', px, py, windowData.windowType, trimmed));
+                        candidates.push(generateKey('drawTextEx', px, py, windowData.windowType, trimmed));
+                    }
+                    for (const key of candidates) {
+                        if (windowData.texts.has(key)) return true;
+                    }
+                    for (const entry of windowData.texts.values()) {
+                        if (!entry) continue;
+                        const entryVisible = entry.visibleText || stripRpgmEscapes(entry.convertedText || entry.rawText || '');
+                        if (trimmed && entryVisible && entryVisible.indexOf(trimmed) !== -1) return true;
+                        const bounds = entry.bounds;
+                        if (!bounds) continue;
+                        const withinY = py >= (bounds.y1 - WINDOW_Y_TOL) && py <= (bounds.y2 + WINDOW_Y_TOL);
+                        const withinX = px >= (bounds.x1 - JOIN_PAD) && px <= (bounds.x2 + JOIN_PAD);
+                        if (!withinY || !withinX) continue;
+                        if (!trimmed) return true;
+                    }
+                } catch (_) { /* ignore lookup errors */ }
+                return false;
+            }
+
+            function hookBitmapDrawFunc(funcName) {
+                const orig = Bitmap.prototype[funcName];
+                if (typeof orig !== 'function') return false;
+                Bitmap.prototype[funcName] = function(text, x, y, maxWidth, lineHeight, align) {
+                    try {
+                        const textStr = String(text);
+                        if (!textStr) return orig.apply(this, arguments);
+
+                        let owner = null;
+                        try { owner = contentsOwners.get(this) || null; } catch (_) {}
+                        let windowOwnsFragment = false;
+                        if (owner && owner.constructor && owner.constructor.name === 'Window_Help') {
+                            return orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        }
+                        if (owner && owner.contents) {
+                            const depth = owner.contents._trWindowPipelineDepth || 0;
+                            windowOwnsFragment = windowPipelineHasEntry(owner, x, y, textStr);
+                            if (depth > 0 && windowOwnsFragment) {
+                                return orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                            }
+                        }
+
+                        const trimmedFragment = textStr.trim();
+                        const hasControlSequences = /\x1b|\\[A-Za-z]|c\[[^\]]*]|i\[[^\]]*]|n\[[^\]]*]/.test(textStr);
+                        if (owner && hasControlSequences) {
+                            return orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        }
+                        if (owner && windowOwnsFragment && trimmedFragment.length <= 2) {
+                            return orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        }
+
+                        // Bypass our own signed strings
+                        if (textStr.startsWith(REDRAW_SIGNATURE)) {
+                            const clean = textStr.substring(REDRAW_SIGNATURE.length);
+                            return orig.call(this, clean, x, y, maxWidth, lineHeight, align);
+                        }
+
+                        // Exclude message and name box windows: their pipelines manage translation
+                        try {
+                            if (owner && owner.constructor && (owner.constructor.name === 'Window_Message' || owner.constructor.name === 'Window_NameBox')) {
+                                return orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                            }
+                        } catch (_) {}
+
+                        // Suppress overlapping draws right after a translated flush
+                        if (!textStr.startsWith(REDRAW_SIGNATURE)) {
+                            try {
+                                // Collect suppression rects from local map and any window-level requests
+                                let rects = supMap.get(this);
+                                if (!Array.isArray(rects)) rects = [];
+                                if (Array.isArray(this._trSuppressRects) && this._trSuppressRects.length) {
+                                    rects = rects.concat(this._trSuppressRects);
+                                }
+                                if (Array.isArray(rects) && rects.length) {
+                                    const now = Date.now();
+                                    for (let i = rects.length - 1; i >= 0; i--) { if (rects[i].exp <= now) rects.splice(i,1); }
+                                    if (Array.isArray(this._trSuppressRects)) {
+                                        for (let i = this._trSuppressRects.length - 1; i >= 0; i--) {
+                                            if (this._trSuppressRects[i].exp <= now) this._trSuppressRects.splice(i,1);
+                                        }
+                                    }
+                                    let wEst = 0;
+                                    try { wEst = Math.ceil(this.measureTextWidth(textStr.trim() || textStr)); } catch (_) { wEst = (textStr.length * ((this.fontSize||24)*0.6))|0; }
+                                    const x1 = Number(x)||0, y1 = Number(y)||0;
+                                    const x2 = x1 + Math.max(1, wEst);
+                                    const y2 = y1 + Math.max(1, Number(lineHeight)|| (this.fontSize||24));
+                                    for (const r of rects) {
+                                        const overlaps = !(x2 < r.x1 || x1 > r.x2 || y2 < r.y1 || y1 > r.y2);
+                                        if (!overlaps) continue;
+                                        const ttrim = (textStr.trim() || textStr);
+                                        const tlen = ttrim.length;
+                                        const content = r.content || '';
+                                        const isSubpart = content && (content.indexOf(ttrim) !== -1);
+                                        const relativeShort = content ? (tlen <= Math.max(4, Math.floor(content.length / 3))) : false;
+                                        if (tlen <= 3 || isSubpart || relativeShort) {
+                                            return; // skip overlapping residual draw
+                                        }
+                                    }
+                                }
+                            } catch (_) {}
+                        }
+
+                        // Aggregate short fragments drawn on same line
+                        const agg = getAgg(this);
+                        const key = yKeyFor(y);
+                        let line = agg.lines.get(key) || { y: Math.round(Number(y)||0), items: [], lastX: Number(x)||0, lastW: 0, lineHeight: lineHeight||24, baseState: null, multiColor: false };
+                        agg.lines.set(key, line);
+                        const xi = Math.round(Number(x)||0);
+                        let w = 0; try { w = Math.ceil(this.measureTextWidth(textStr.trim() || textStr)); } catch (_) { w = (textStr.length * ((this.fontSize||24)*0.6))|0; }
+
+                        // If we've just flushed this line region, skip drawing overlapping leftover fragments
+                        try {
+                            if (line.recentFlush && Date.now() - line.recentFlush.t < 200) {
+                                if (xi >= (line.recentFlush.x1 - JOIN_PAD) && xi <= (line.recentFlush.x2 + JOIN_PAD)) {
+                                    return; // suppress duplicate fragment after flush
+                                }
+                            }
+                        } catch (_) {}
+
+                        // If gap is large (likely a new line), flush existing line first
+                        if (line.items.length>0) {
+                            const expectedNextX = line.lastX + line.lastW;
+                            const gap = Math.abs(xi - expectedNextX);
+                            const tolerance = Math.max(JOIN_PAD * 6, Math.floor(line.lastW * 1.2) + 12);
+                            if (gap > tolerance) {
+                                flushLine(this, key, line);
+                                line = { y: Math.round(Number(y)||0), items: [], lastX: xi, lastW: w, lineHeight: lineHeight||24, baseState: null, multiColor: false };
+                                agg.lines.set(key, line);
+                            }
+                        }
+
+                        const stateSnapshot = captureBitmapDrawState(this);
+                        if (!line.baseState) line.baseState = stateSnapshot; else if (!line.multiColor && statesDiffer(line.baseState, stateSnapshot)) { line.multiColor = true; }
+                        line.items.push({ x: xi, text: textStr, w, state: stateSnapshot });
+                        line.lastX = xi;
+                        line.lastW = w;
+                        const result = orig.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        if (!owner || !(owner.contents && owner.contents._trAggregationDepth > 0)) { flushAll(this); }
+                        return result;
+                    } catch (e) {
+                        logger.error(`[Bitmap.${funcName} Hook Error]`, e);
+                        return orig.apply(this, arguments);
+                    }
+                };
+                dbg(`[Bitmap] Hooked Bitmap.${funcName}`);
+                return true;
+            }
+
+            // Hook standard drawText and custom CBR variants
             Bitmap.prototype.drawText = function(text, x, y, maxWidth, lineHeight, align) {
                 try {
                     const textStr = String(text);
@@ -2414,11 +2847,28 @@
 
                     let owner = null;
                     try { owner = contentsOwners.get(this) || null; } catch (_) {}
-                    if (owner && owner.contents && owner.contents._trPreferWindowPipeline) {
+                    let windowOwnsFragment = false;
+                    if (owner && owner.constructor && owner.constructor.name === 'Window_Help') {
                         return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                    }
+                    if (owner && owner.contents) {
+                        const depth = owner.contents._trWindowPipelineDepth || 0;
+                        windowOwnsFragment = windowPipelineHasEntry(owner, x, y, textStr);
+                        if (depth > 0 && windowOwnsFragment) {
+                            return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        }
                     }
 
                     // candidate logging disabled
+
+                    const trimmedFragment = textStr.trim();
+                    const hasControlSequences = /\x1b|\\[A-Za-z]|c\[[^\]]*]|i\[[^\]]*]|n\[[^\]]*]/.test(textStr);
+                    if (owner && hasControlSequences) {
+                        return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                    }
+                    if (owner && windowOwnsFragment && trimmedFragment.length <= 2) {
+                        return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                    }
 
                     // Track full translated lines we just drew (signed) to suppress substring tails
                     if (textStr.startsWith(REDRAW_SIGNATURE)) {
@@ -2522,8 +2972,11 @@
                     }
 
                     // Aggregate very short fragments drawn on same line (likely forming a word)
-                    const trimmed = textStr.trim();
-                    const isShort = trimmed.length <= 2;
+                    const rawSegment = textStr;
+                    if (!rawSegment) return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                    const trimmed = rawSegment.trim();
+                    const segmentBasis = trimmed.length > 0 ? trimmed : rawSegment;
+                    const isShort = segmentBasis.length <= 2;
                     const alignLefty = !align || align === 'left';
                     if (isShort && alignLefty) {
                         const agg = getAgg(this);
@@ -2536,15 +2989,15 @@
                                 lastX: Number(x)||0,
                                 lastW: 0,
                                 lineHeight: lineHeight||24,
-                                timer: null,
-                                drawState: captureBitmapDrawState(this)
+                                baseState: null,
+                                multiColor: false
                             };
                             agg.lines.set(key, line);
                         }
 
                         // Measure width to decide adjacency
                         let w = 0;
-                        try { w = Math.ceil(this.measureTextWidth(trimmed)); } catch (_) { w = (trimmed.length * ((this.fontSize||24)*0.6))|0; }
+                        try { w = Math.ceil(this.measureTextWidth(segmentBasis)); } catch (_) { w = (segmentBasis.length * ((this.fontSize||24)*0.6))|0; }
                         const xi = Number(x)||0;
 
                         // If we've just flushed this line region, skip drawing overlapping leftover fragments
@@ -2556,12 +3009,12 @@
                             }
                         } catch (_) {}
 
-                        // If gap is large (new run), flush existing line first
+                        // If gap is large (likely a new line), flush existing line first
                         if (line.items.length>0) {
                             const expectedNextX = line.lastX + line.lastW;
-                            if (Math.abs(xi - expectedNextX) > Math.max(JOIN_PAD, Math.floor(w*0.3))) {
-                                // Different run; flush old then start new
-                                if (line.timer) clearTimeout(line.timer);
+                            const gap = Math.abs(xi - expectedNextX);
+                            const tolerance = Math.max(JOIN_PAD * 6, Math.floor(line.lastW * 1.2) + 12);
+                            if (gap > tolerance) {
                                 flushLine(this, key, line);
                                 line = {
                                     y: Math.round(Number(y)||0),
@@ -2569,20 +3022,27 @@
                                     lastX: xi,
                                     lastW: w,
                                     lineHeight: lineHeight||24,
-                                    timer: null,
-                                    drawState: captureBitmapDrawState(this)
+                                    baseState: null,
+                                    multiColor: false
                                 };
                                 agg.lines.set(key, line);
                             }
                         }
 
-                        if (!line.drawState) line.drawState = captureBitmapDrawState(this);
-                        line.items.push({ x: xi, text: trimmed, w });
+                        const stateSnapshot = captureBitmapDrawState(this);
+                        if (!line.baseState) line.baseState = stateSnapshot;
+                        else if (!line.multiColor && statesDiffer(line.baseState, stateSnapshot)) {
+                            line.multiColor = true;
+                        }
+                        line.items.push({ x: xi, text: rawSegment, w, state: stateSnapshot });
                         line.lastX = xi;
                         line.lastW = w;
-                        scheduleFlush(this, key, line);
                         // Draw original immediately; translation will clear/replace soon
-                        return original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        const result = original.call(this, textStr, x, y, maxWidth, lineHeight, align);
+                        if (!owner || !(owner.contents && owner.contents._trAggregationDepth > 0)) {
+                            flushAll(this);
+                        }
+                        return result;
                     }
 
                     const norm = textStr.trim();
@@ -2607,6 +3067,9 @@
                     // Miss: draw original, request translation for future draws
                     const res = original.call(this, textStr, x, y, maxWidth, lineHeight, align);
                     translationCache.requestTranslation(norm).catch(() => {});
+                    if (!owner || !(owner.contents && owner.contents._trAggregationDepth > 0)) {
+                        flushAll(this);
+                    }
                     return res;
                 } catch (e) {
                     logger.error('[Bitmap.drawText Hook Error]', e);
@@ -2614,6 +3077,10 @@
                 }
             };
             dbg('[Bitmap] Hooked Bitmap.drawText');
+
+            // Custom hooks (present in CBR_core.js)
+            try { hookBitmapDrawFunc('drawTextS'); } catch (_) {}
+            try { hookBitmapDrawFunc('drawTextM'); } catch (_) {}
         } catch (e) {
             logger.error('[Bitmap Hook Error]', e);
         }
