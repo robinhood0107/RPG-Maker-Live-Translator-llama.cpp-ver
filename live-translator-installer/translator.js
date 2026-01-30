@@ -142,21 +142,25 @@
         }
     }
 
-    function buildLocalMessages(text, systemPrompt) {
-        // System must come from config; user message must be text only
-        const sys = (systemPrompt ?? '').toString();
-        const messages = [];
-        if (sys.trim()) messages.push({ role: 'system', content: sys });
-        messages.push({ role: 'user', content: String(text) });
-        return messages;
-    }
-
     async function translateOneLocal(text, cfg) {
         const url = `http://${cfg.address}:${cfg.port}/v1/chat/completions`;
         const sourceText = String(text ?? '');
+        const lines = sourceText.split(/\r?\n/);
+        const textMap = {};
+        for (let i = 0; i < lines.length; i += 1) {
+            textMap[String(i + 1)] = lines[i];
+        }
+        const userPayload = { text: textMap };
+        const systemPrompt = typeof cfg.system_prompt === 'string' ? cfg.system_prompt : '';
+        const messages = [];
+        if (systemPrompt) {
+            messages.push({ role: 'system', content: systemPrompt });
+        }
+        messages.push({ role: 'user', content: JSON.stringify(userPayload) });
+
         const body = {
             model: cfg.model,
-            messages: buildLocalMessages(sourceText, cfg.system_prompt),
+            messages,
             temperature: cfg.temperature,
             top_p: cfg.top_p,
             top_k: cfg.top_k,
@@ -183,14 +187,33 @@
 
         const data = await resp.json();
         try {
-            // Prefer chat.completions schema
             const choice = data && data.choices && data.choices[0];
             const content = choice && choice.message && typeof choice.message.content === 'string'
                 ? choice.message.content
                 : (choice && typeof choice.text === 'string' ? choice.text : '');
 
-            // Strip local LLM control codes like <think>...</think>
             const sanitized = sanitizeLocalOutput(String(content || ''));
+
+            let parsed = null;
+            try {
+                parsed = JSON.parse(sanitized);
+            } catch (_) {
+                parsed = null;
+            }
+
+            const originalLines = sourceText.split(/\r?\n/);
+            if (parsed && typeof parsed === 'object') {
+                const container = parsed.text && typeof parsed.text === 'object'
+                    ? parsed.text
+                    : parsed;
+                const outLines = originalLines.map((line, idx) => {
+                    const key = String(idx + 1);
+                    const v = container && typeof container[key] === 'string' ? container[key] : line;
+                    return v;
+                });
+                return outLines.join('\n');
+            }
+
             return sanitized;
         } catch (e) {
             console.error('[Local LLM] Parse error:', e);

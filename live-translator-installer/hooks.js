@@ -30,6 +30,22 @@
             REDRAW_SIGNATURE,
         } = options;
 
+        const logEscape = (level, message, details) => {
+            try {
+                const logFn = logger && typeof logger[level] === 'function'
+                    ? logger[level]
+                    : (level === 'trace' && logger && typeof logger.debug === 'function' ? logger.debug : null);
+                if (!logFn) return;
+                if (details) {
+                    logFn(`[EscapeCodes] ${message}`, details);
+                } else {
+                    logFn(`[EscapeCodes] ${message}`);
+                }
+            } catch (_) {
+                // swallow logging errors
+            }
+        };
+
         if (typeof stripRpgmEscapes !== 'function'
             || typeof prepareTextForTranslation !== 'function'
             || typeof restoreControlCodes !== 'function') {
@@ -86,11 +102,211 @@
         return { x: startX, y: startY };
     }
 
+    const stripPlaceholderDecorators = (token) => String(token || '').replace(/[^\w]/g, '');
+    const escapeRegExp = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const countOccurrences = (text, needle) => {
+        if (!needle) return 0;
+        const re = new RegExp(escapeRegExp(String(needle)), 'g');
+        let m = null;
+        let count = 0;
+        while ((m = re.exec(String(text || '')))) {
+            count++;
+            if (count > 32) break; // guard runaway
+        }
+        return count;
+    };
+
+    function normalizePlaceholdersForRestore(text, placeholders) {
+        if (!placeholders || !placeholders.length) return null;
+        let output = String(text || '');
+        let changed = false;
+        const plainTokens = placeholders.map(stripPlaceholderDecorators);
+        placeholders.forEach((placeholder, idx) => {
+            if (output.includes(placeholder)) return;
+            const plain = plainTokens[idx];
+            if (!plain) return;
+            const patterns = [
+                new RegExp(`\\b${escapeRegExp(plain)}\\b`),
+                new RegExp(escapeRegExp(plain)),
+            ];
+            const isTag0 = idx === 0 && /TAG0/i.test(plain);
+            if (isTag0) {
+                patterns.push(new RegExp(`TAG0`, 'i'));
+            }
+            for (const pattern of patterns) {
+                if (pattern.test(output)) {
+                    output = output.replace(pattern, placeholder);
+                    changed = true;
+                    break;
+                }
+            }
+        });
+        return changed ? output : null;
+    }
+
+    function validatePlaceholderPresence(text, placeholders) {
+        if (!placeholders || !placeholders.length) return { missingStandard: [], missingPlain: [] };
+        const value = String(text || '');
+        const plainTokens = placeholders.map(stripPlaceholderDecorators);
+        const missingStandard = [];
+        const missingPlain = [];
+        const countMismatches = [];
+        placeholders.forEach((token, idx) => {
+            const countStd = countOccurrences(value, token);
+            if (countStd === 0) {
+                missingStandard.push(token);
+            } else if (countStd !== 1) {
+                countMismatches.push({ token, count: countStd });
+            }
+            const plain = plainTokens[idx];
+            if (plain && !new RegExp(escapeRegExp(plain)).test(value)) {
+                missingPlain.push(plain);
+            } else if (plain) {
+                const countPlain = countOccurrences(value, plain);
+                if (countPlain !== 1) {
+                    countMismatches.push({ token: plain, count: countPlain, plain: true });
+                }
+            }
+        });
+        return { missingStandard, missingPlain, countMismatches };
+    }
+
+    function createEscapeAwarePayload(rawText, context = 'message') {
+        const resolved = String(rawText || '');
+        const visible = stripRpgmEscapes(resolved).trim();
+        if (!visible) return null;
+
+        let placeholderInfo = null;
+        let translationSource = visible;
+        try {
+            placeholderInfo = prepareTextForTranslation(resolved);
+            translationSource = placeholderInfo && placeholderInfo.textForTranslation
+                ? String(placeholderInfo.textForTranslation || '')
+                : String(visible || '');
+        } catch (error) {
+            logger.warn(`[GameMessage ${context}] prepareTextForTranslation failed; using stripped text.`, error);
+            translationSource = String(visible || '');
+        }
+
+        const normalizedTranslationSource = String(translationSource || '').trim();
+
+        return {
+            resolved,
+            visible,
+            placeholderInfo,
+            translationSource,
+            normalizedTranslationSource,
+        };
+    }
+
+    function restoreMessageText(translated, payload) {
+        if (!payload) return translated;
+        const placeholders = payload.placeholderInfo && Array.isArray(payload.placeholderInfo.placeholders)
+            ? payload.placeholderInfo.placeholders
+            : null;
+
+        let candidate = translated;
+
+        if (placeholders && placeholders.length) {
+            const { missingStandard, missingPlain, countMismatches } = validatePlaceholderPresence(candidate, placeholders);
+            const irregularities = [];
+            if (missingStandard.length) irregularities.push('missing_standard');
+            if (missingPlain.length) irregularities.push('missing_plain');
+            if (countMismatches.length) irregularities.push('count_mismatch');
+            if (irregularities.length) {
+                logEscape('debug', `Placeholder irregularity detected (${irregularities.join(',')}); attempting recovery.`, {
+                    translatedPreview: preview(String(candidate || '')),
+                    missingStandard,
+                    missingPlain,
+                    countMismatches,
+                });
+                const recovered = normalizePlaceholdersForRestore(candidate, placeholders);
+                if (recovered) {
+                    candidate = recovered;
+                    logEscape('debug', 'Recovered placeholders via plaintext TAG scan.', {
+                        recoveredPreview: preview(String(candidate || '')),
+                    });
+                } else {
+                    logEscape('debug', 'Recovery failed; proceeding with best-effort restore.', {
+                        translatedPreview: preview(String(candidate || '')),
+                    });
+                }
+            }
+            const postValidation = validatePlaceholderPresence(candidate, placeholders);
+            if (postValidation.missingStandard.length
+                || postValidation.missingPlain.length
+                || (postValidation.countMismatches && postValidation.countMismatches.length)) {
+                logEscape('debug', 'Placeholder validation failed after recovery; falling back to original text.', {
+                    missingStandard: postValidation.missingStandard,
+                    missingPlain: postValidation.missingPlain,
+                    countMismatches: postValidation.countMismatches,
+                });
+                const stripped = stripRpgmEscapes(candidate || '').trim();
+                logEscape('debug', 'Using stripped translated text as fallback.', {
+                    strippedPreview: preview(stripped),
+                });
+                return stripped || payload.resolved;
+            }
+        }
+
+        try {
+            const restored = restoreControlCodes(candidate, payload.placeholderInfo, payload.resolved);
+            if (typeof restored === 'string' && restored.length) {
+                if (/⟦(?:TAG|NL)\d+⟧/.test(restored)) {
+                    logEscape('debug', 'Restored text still contains placeholders; falling back to original text.', {
+                        restoredPreview: preview(restored),
+                    });
+                    const stripped = stripRpgmEscapes(candidate || '').trim();
+                    logEscape('debug', 'Using stripped translated text as fallback.', {
+                        strippedPreview: preview(stripped),
+                    });
+                    return stripped || payload.resolved;
+                }
+                return restored;
+            }
+        } catch (error) {
+            logger.warn('[GameMessage] restoreControlCodes failed; falling back to original text.', error);
+        }
+        const stripped = stripRpgmEscapes(candidate || '').trim();
+        logEscape('debug', 'restoreControlCodes threw; using stripped translated text as fallback.', {
+            strippedPreview: preview(stripped),
+        });
+        return stripped || payload.resolved;
+    }
+
     function trackGameMessage() {
         if (Window_Message.prototype.startMessage && Window_Message.prototype.startMessage.__trWrapped) {
             diag('[GameMessage] Hooks already installed; skipping duplicate wrap.');
             return;
         }
+
+        // Ensure Window_Message contents are marked for bitmap-level bypass
+        const wrapMessageContents = (Ctor) => {
+            if (!Ctor || !Ctor.prototype || typeof Ctor.prototype.createContents !== 'function') return;
+            if (Ctor.prototype.createContents.__trWrapped) return;
+            const originalCreateContents = Ctor.prototype.createContents;
+            Ctor.prototype.createContents = function(...args) {
+                const res = originalCreateContents.apply(this, args);
+                try {
+                    this._trHasDedicatedTextHook = true;
+                    if (this.contents) {
+                        this.contents._trHasDedicatedTextHook = true;
+                        this.contents._trMessageContents = true;
+                        if (contentsOwners && typeof contentsOwners.set === 'function') {
+                            contentsOwners.set(this.contents, this);
+                        }
+                    }
+                } catch (_) {}
+                return res;
+            };
+            Ctor.prototype.createContents.__trWrapped = true;
+            Ctor.prototype.createContents.__trOriginal = originalCreateContents;
+        };
+
+        try {
+            wrapMessageContents(Window_Message);
+            wrapMessageContents(typeof Window_Message_Battle !== 'undefined' ? Window_Message_Battle : null);
+        } catch (_) {}
 
         // Custom $gameMessage state tracker - independent of window lifecycle
         const gameMessageState = {
@@ -123,15 +339,14 @@
 
                 const rawAll = $gameMessage && $gameMessage.allText ? $gameMessage.allText() : '';
                 const resolved = typeof this.convertEscapeCharacters === 'function' ? this.convertEscapeCharacters(String(rawAll)) : String(rawAll);
-                const visible = stripRpgmEscapes(resolved);
-
-                const finalText = visible.trim();
+                const payload = createEscapeAwarePayload(resolved, 'start');
+                const finalText = payload ? payload.visible : stripRpgmEscapes(resolved).trim();
                 if (finalText && finalText !== gameMessageState.currentText) {
                     gameMessageState.currentText = finalText;
                     diag(`[GameMessage] Final rendered text: "${preview(finalText)}"`);
                     if (!this._trSentTranslateThisSession) {
                         this._trSentTranslateThisSession = true;
-                        this.processCompleteMessage(finalText, gameMessageState.session);
+                        this.processCompleteMessage(payload || resolved, gameMessageState.session);
                     }
                 }
             } catch (e) { logger.warn('[GameMessage startMessage hook error]', e); }
@@ -154,39 +369,27 @@
                 return originalProcessCharacter.call(this, textState);
             }
 
-            // Get the current character being processed
-            const char = textState.text[textState.index];
-            if (!char) {
-                return originalProcessCharacter.call(this, textState);
-            }
-
-            // Build up the full text as it's being processed
-            if (!this._trCurrentMessageText) {
-                this._trCurrentMessageText = '';
+            const sourceText = textState && textState.text ? String(textState.text) : '';
+            if (!this._trCurrentMessagePayload) {
+                this._trCurrentMessagePayload = createEscapeAwarePayload(sourceText, 'processCharacter');
                 this._trMessageSession = ++gameMessageState.session;
                 gameMessageState.isActive = true;
                 gameMessageState.lastUpdate = Date.now();
             }
 
-            // Add this character to our accumulated text
-            if (char !== '\x1b') { // Ignore escape character sequences
-                this._trCurrentMessageText += char;
-            }
-
             const result = originalProcessCharacter.call(this, textState);
 
-            // If this is the last character or we've reached a good stopping point
-            if (textState.index >= textState.text.length - 1) {
-                const finalText = this._trCurrentMessageText.trim();
+            if (textState && textState.index >= textState.text.length - 1) {
+                const payload = this._trCurrentMessagePayload || createEscapeAwarePayload(sourceText, 'processCharacter-final');
+                this._trCurrentMessagePayload = null;
+                const finalText = payload ? payload.visible : stripRpgmEscapes(sourceText).trim();
                 if (finalText && finalText !== gameMessageState.currentText) {
                     gameMessageState.currentText = finalText;
                     diag(`[GameMessage] Final rendered text: "${preview(finalText)}"`);
-                    
-                    // Start translation for the complete text
-                    this.processCompleteMessage(finalText, this._trMessageSession);
+                    this.processCompleteMessage(payload || sourceText, this._trMessageSession);
+                } else if (payload) {
+                    this.processCompleteMessage(payload, this._trMessageSession);
                 }
-                // Reset for next message
-                this._trCurrentMessageText = '';
             }
 
             return result;
@@ -196,20 +399,20 @@
         Window_Message.prototype.processCharacter = wrappedProcessCharacter;
 
         // Process complete message text for translation
-        Window_Message.prototype.processCompleteMessage = function(text, sessionId) {
-            const raw = String(text || '').trim();
-            if (!raw) {
+        Window_Message.prototype.processCompleteMessage = function(message, sessionId) {
+            const payload = (message && typeof message === 'object' && ('resolved' in message || 'visible' in message))
+                ? message
+                : createEscapeAwarePayload(message, 'processComplete');
+            if (!payload || !payload.visible) {
                 diag('[GameMessage] Skipping translation: empty message');
                 return;
             }
 
-            const placeholderInfo = prepareTextForTranslation(raw);
-            const translationSource = placeholderInfo && placeholderInfo.textForTranslation
-                ? placeholderInfo.textForTranslation
-                : raw;
-            const normalizedSource = String(translationSource || '').trim();
+            const translationSource = payload.translationSource;
+            const normalizedSource = payload.normalizedTranslationSource
+                || String(translationSource || '').trim();
             if (!normalizedSource || translationCache.shouldSkip(normalizedSource)) {
-                diag(`[GameMessage] Skipping translation: "${preview(raw)}"`);
+                diag(`[GameMessage] Skipping translation: "${preview(payload.visible)}"`);
                 return;
             }
 
@@ -219,21 +422,27 @@
                 .then(translated => {
                     // Check if session is still valid
                     if (this._trSessionId !== sessionId || !gameMessageState.isActive) {
-                        diag(`[GameMessage] Session expired for: "${preview(raw)}"`);
+                        diag(`[GameMessage] Session expired for: "${preview(payload.visible)}"`);
                         return;
                     }
 
-                    let restored = restoreControlCodes(translated, placeholderInfo, raw);
+                    let restored = restoreMessageText(translated, payload);
                     if (typeof restored !== 'string' || !restored.trim()) {
-                        restored = raw;
+                        restored = payload.resolved;
                     }
 
-                    if (raw === restored) {
-                        dbg(`[GameMessage Skip] Original and translated text are identical: "${preview(raw)}"`);
+                    const restoredVisible = stripRpgmEscapes(restored || '').trim();
+                    if (!restoredVisible) {
+                        dbg('[GameMessage Skip] Restored text empty after stripping; keeping original.');
                         return;
                     }
 
-                    dbg(`[GameMessage] Translation: "${preview(raw)}" -> "${preview(restored)}"`);
+                    if (restoredVisible === payload.visible) {
+                        dbg(`[GameMessage Skip] Original and translated text are identical: "${preview(payload.visible)}"`);
+                        return;
+                    }
+
+                    dbg(`[GameMessage] Translation: "${preview(payload.visible)}" -> "${preview(restoredVisible)}"`);
 
                     const ready = this.contents && this.visible && this.isOpen();
                     if (!ready) {
@@ -292,6 +501,7 @@
                     wm._trStartedThisSession = false;
                     wm._trSentTranslateThisSession = false;
                     wm._trMsgStartSession = null;
+                    wm._trCurrentMessagePayload = null;
                     wm._trMsgStartX = undefined;
                     wm._trMsgStartY = undefined;
                 }
@@ -1300,6 +1510,10 @@
                 }
 
                 if (bitmap._trPreferWindowPipeline && bitmap._trWindowPipelineDepth > 0) {
+                    return originalFn.apply(bitmap, callArgs);
+                }
+
+                if (bitmap._trMessageContents) {
                     return originalFn.apply(bitmap, callArgs);
                 }
 

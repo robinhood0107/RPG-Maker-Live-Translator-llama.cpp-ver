@@ -39,4 +39,6 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 
 1.3 - add an option to disable CJK filter (for source text)
 
+1.4 - fix some duplicate texts, support control codes, and prevent bitmap level detection on main game message
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

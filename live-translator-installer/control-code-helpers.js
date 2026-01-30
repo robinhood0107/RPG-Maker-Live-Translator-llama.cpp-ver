@@ -17,6 +17,18 @@
 
     const createControlCodeRegex = () => new RegExp(CONTROL_CODE_PATTERN, 'g');
 
+    function getActiveProvider() {
+        try {
+            const cfg = globalScope && globalScope.LiveTranslatorConfig;
+            const providerRaw = cfg && cfg.provider;
+            if (typeof providerRaw === 'string') {
+                const trimmed = providerRaw.trim();
+                if (trimmed) return trimmed.toLowerCase();
+            }
+        } catch (_) {}
+        return null;
+    }
+
     // Remove RPGM escape sequences so comparisons/telemetry operate on visible text.
     function stripRpgmEscapes(input) {
         if (input === null || input === undefined) return '';
@@ -33,6 +45,19 @@
             placeholders.push(token);
             return token;
         });
+
+        const provider = getActiveProvider();
+
+        if (provider === 'local') {
+            const newlineData = {
+                tokens: [],
+                values: [],
+                positions: [],
+                baseLength: 0,
+            };
+            const textForTranslation = withoutControlCodes;
+            return { textForTranslation, placeholders, newlineData, original };
+        }
 
         const newlineData = {
             tokens: [],

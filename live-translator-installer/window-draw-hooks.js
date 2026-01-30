@@ -691,7 +691,9 @@
                 const existing = windowData.texts.get(dupKey);
                 if (existing && existing.rawText === textStr && existing.convertedText === convertedTrimmed) {
                     if (existing.translationStatus === 'completed' && existing.translatedText) {
-                        try { redrawTranslatedText(existing, windowData); } catch (_) {}
+                        if (windowData.windowType !== 'Window_NameBox') {
+                            try { redrawTranslatedText(existing, windowData); } catch (_) {}
+                        }
                     }
                 }
 
