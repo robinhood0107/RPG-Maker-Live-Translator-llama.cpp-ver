@@ -82,7 +82,12 @@
             top_k: valueOrDefault(cfg.top_k || cfg.TopK, null),
             repeat_penalty: valueOrDefault(cfg.repeat_penalty || cfg.repeatPenalty || cfg.repetition_penalty, null),
             min_p: valueOrDefault(cfg.min_p || cfg.MinP, null),
-            top_p: valueOrDefault(cfg.top_p || cfg.TopP, 0.95)
+            top_p: valueOrDefault(cfg.top_p || cfg.TopP, 0.95),
+            separate_multiline_requests: Boolean(
+                cfg.separate_multiline_requests
+                || cfg.separateMultilineRequests
+                || cfg.separate_multiline
+            )
         };
 
         if (!out.model || typeof out.model !== 'string' || !out.model.trim()) {
@@ -146,11 +151,20 @@
         const url = `http://${cfg.address}:${cfg.port}/v1/chat/completions`;
         const sourceText = String(text ?? '');
         const lines = sourceText.split(/\r?\n/);
+
+        if (cfg && cfg.separate_multiline_requests && lines.length > 1) {
+            const perLine = await Promise.all(lines.map((line) => {
+                if (!line) return '';
+                return translateOneLocal(line, { ...cfg, separate_multiline_requests: false });
+            }));
+            return perLine.join('\n');
+        }
+
         const textMap = {};
         for (let i = 0; i < lines.length; i += 1) {
             textMap[String(i + 1)] = lines[i];
         }
-        const userPayload = { text: textMap };
+        const userPayload = textMap;
         const systemPrompt = typeof cfg.system_prompt === 'string' ? cfg.system_prompt : '';
         const messages = [];
         if (systemPrompt) {
@@ -203,7 +217,7 @@
 
             const originalLines = sourceText.split(/\r?\n/);
             if (parsed && typeof parsed === 'object') {
-                const container = parsed.text && typeof parsed.text === 'object'
+                const container = parsed && typeof parsed.text === 'object'
                     ? parsed.text
                     : parsed;
                 const outLines = originalLines.map((line, idx) => {
