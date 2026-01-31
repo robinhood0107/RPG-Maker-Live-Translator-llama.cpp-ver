@@ -274,6 +274,17 @@
         return stripped || payload.resolved;
     }
 
+    function restoreMessageTextStreaming(translated, payload) {
+        if (!payload || typeof translated !== 'string') return translated;
+        if (!payload.placeholderInfo) return translated;
+        try {
+            const restored = restoreControlCodes(translated, payload.placeholderInfo, payload.resolved);
+            return typeof restored === 'string' ? restored : translated;
+        } catch (_) {
+            return translated;
+        }
+    }
+
     function trackGameMessage() {
         if (Window_Message.prototype.startMessage && Window_Message.prototype.startMessage.__trWrapped) {
             diag('[GameMessage] Hooks already installed; skipping duplicate wrap.');
@@ -316,6 +327,34 @@
             session: 0 // increments to invalidate pending translations
         };
 
+        const redrawMessageText = (windowInstance, text, sessionId, overrides = {}) => {
+            if (!windowInstance) return false;
+            const ready = windowInstance.contents && windowInstance.visible && windowInstance.isOpen();
+            const coords = resolveMessageStartCoordinates(windowInstance, overrides);
+            if (!ready) {
+                windowInstance._trPendingRedraw = { text, sessionId, x: coords.x, y: coords.y };
+                return false;
+            }
+
+            try { windowInstance.contents.clear(); } catch (_) {}
+            if (typeof windowInstance.resetFontSettings === 'function') windowInstance.resetFontSettings();
+            drawMessageFaceIfNeeded(windowInstance);
+
+            const signed = REDRAW_SIGNATURE + text;
+            windowInstance._trBypassProcessCharacter = (windowInstance._trBypassProcessCharacter || 0) + 1;
+            try {
+                windowInstance.drawTextEx(signed, coords.x, coords.y);
+                if (windowInstance._textState) {
+                    windowInstance._textState.index = windowInstance._textState.text.length;
+                }
+                windowInstance._showFast = true;
+                windowInstance._lineShowFast = true;
+            } finally {
+                windowInstance._trBypassProcessCharacter = Math.max(0, (windowInstance._trBypassProcessCharacter || 1) - 1);
+            }
+            return true;
+        };
+
         // Prefer hooking startMessage to get full resolved text once
         const originalStartMessage = Window_Message.prototype.startMessage.__trOriginal || Window_Message.prototype.startMessage;
         const wrappedStartMessage = function() {
@@ -328,6 +367,14 @@
                 this._trStartedThisSession = true;
                 this._trSentTranslateThisSession = false;
                 this._trMsgStartSession = this._trMessageSession;
+                try {
+                    if (this._trStreamAbort && typeof this._trStreamAbort.abort === 'function') {
+                        this._trStreamAbort.abort();
+                    }
+                } catch (_) {}
+                this._trStreamAbort = null;
+                this._trStreamText = '';
+                this._trPendingRedraw = null;
 
                 try {
                     if (this && this._textState) {
@@ -417,8 +464,43 @@
             }
 
             this._trSessionId = sessionId;
-            
-            translationCache.requestTranslation(translationSource)
+
+            try {
+                if (this._trStreamAbort && typeof this._trStreamAbort.abort === 'function') {
+                    this._trStreamAbort.abort();
+                }
+            } catch (_) {}
+            this._trStreamAbort = null;
+            this._trStreamText = '';
+
+            const applyStreamDelta = (partial) => {
+                if (this._trSessionId !== sessionId || !gameMessageState.isActive) return;
+                if (typeof partial !== 'string' || !partial) return;
+                const restored = restoreMessageTextStreaming(partial, payload);
+                if (!restored || restored === this._trStreamText) return;
+                const restoredVisible = stripRpgmEscapes(restored || '').trim();
+                if (!restoredVisible) return;
+                this._trStreamText = restored;
+                redrawMessageText(this, restored, sessionId);
+            };
+
+            const requestStream = translationCache
+                && typeof translationCache.requestTranslationStream === 'function'
+                    ? translationCache.requestTranslationStream
+                    : null;
+            const streamController = (requestStream && typeof AbortController !== 'undefined')
+                ? new AbortController()
+                : null;
+            if (streamController) this._trStreamAbort = streamController;
+
+            const translationPromise = requestStream
+                ? requestStream.call(translationCache, translationSource, {
+                    onDelta: applyStreamDelta,
+                    signal: streamController ? streamController.signal : undefined
+                })
+                : translationCache.requestTranslation(translationSource);
+
+            translationPromise
                 .then(translated => {
                     // Check if session is still valid
                     if (this._trSessionId !== sessionId || !gameMessageState.isActive) {
@@ -443,33 +525,10 @@
                     }
 
                     dbg(`[GameMessage] Translation: "${preview(payload.visible)}" -> "${preview(restoredVisible)}"`);
-
-                    const ready = this.contents && this.visible && this.isOpen();
-                    if (!ready) {
-                        const coords = resolveMessageStartCoordinates(this);
-                        this._trPendingRedraw = { text: restored, sessionId, x: coords.x, y: coords.y };
-                        return;
-                    }
-
-                    try { this.contents.clear(); } catch (e) {}
-                    if (typeof this.resetFontSettings === 'function') this.resetFontSettings();
-                    drawMessageFaceIfNeeded(this);
-
-                    const coords = resolveMessageStartCoordinates(this);
-                    const signed = REDRAW_SIGNATURE + restored;
-                    this._trBypassProcessCharacter = (this._trBypassProcessCharacter || 0) + 1;
-                    try {
-                        this.drawTextEx(signed, coords.x, coords.y);
-                        if (this._textState) {
-                            this._textState.index = this._textState.text.length;
-                        }
-                        this._showFast = true;
-                        this._lineShowFast = true;
-                    } finally {
-                        this._trBypassProcessCharacter = Math.max(0, (this._trBypassProcessCharacter || 1) - 1);
-                    }
+                    redrawMessageText(this, restored, sessionId);
                 })
                 .catch(err => {
+                    if (err && err.name === 'AbortError') return;
                     logger.error('[GameMessage Translation Error]', err);
                 });
         };
@@ -504,6 +563,14 @@
                     wm._trCurrentMessagePayload = null;
                     wm._trMsgStartX = undefined;
                     wm._trMsgStartY = undefined;
+                    try {
+                        if (wm._trStreamAbort && typeof wm._trStreamAbort.abort === 'function') {
+                            wm._trStreamAbort.abort();
+                        }
+                    } catch (_) {}
+                    wm._trStreamAbort = null;
+                    wm._trStreamText = '';
+                    wm._trPendingRedraw = null;
                 }
             } catch (_) {}
             

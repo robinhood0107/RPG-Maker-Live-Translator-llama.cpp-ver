@@ -228,6 +228,8 @@
             getCacheEntryLimit = () => 0,
             pruneMapToLimit = () => {},
             translatorBatcher,
+            translateTextStream = null,
+            isLocalProvider = false,
             diag = noop,
             settings = {},
         } = options || {};
@@ -241,8 +243,10 @@
             completed: new Map(),
             ongoing: new Map(),
             requestTranslation,
+            requestTranslationStream,
             shouldSkip,
             performTranslation,
+            performTranslationStream,
         };
 
         function shouldSkip(text) {
@@ -299,6 +303,46 @@
             return translationPromise;
         }
 
+        function requestTranslationStream(text, options = {}) {
+            const normalized = String(text || '').trim();
+            telemetrySafe.logTranslation('request', normalized);
+
+            if (cache.completed.has(normalized)) {
+                const existing = cache.completed.get(normalized);
+                telemetrySafe.logTranslation('cache_hit', normalized, existing);
+                return Promise.resolve(existing);
+            }
+
+            if (cache.ongoing.has(normalized)) {
+                return cache.ongoing.get(normalized);
+            }
+
+            telemetrySafe.logTranslation('cache_miss', normalized);
+            const translationPromise = cache.performTranslationStream(normalized, options);
+            cache.ongoing.set(normalized, translationPromise);
+
+            translationPromise
+                .then((translated) => {
+                    try { cache.ongoing.delete(normalized); } catch (_) {}
+                    const limit = getCacheEntryLimit();
+                    if (limit > 0) pruneMapToLimit(cache.completed, limit);
+                    cache.completed.set(normalized, translated);
+                    telemetrySafe.logTranslation('completed', normalized, translated);
+                    if (disk.enabled && typeof disk.appendRecord === 'function') {
+                        try { disk.appendRecord(normalized, translated); } catch (_) {}
+                    }
+                    return translated;
+                })
+                .catch((error) => {
+                    const message = error && error.message ? error.message : 'unknown error';
+                    telemetrySafe.logTranslation('error', normalized, message);
+                    cache.ongoing.delete(normalized);
+                    throw error;
+                });
+
+            return translationPromise;
+        }
+
         async function performTranslation(text) {
             const normalized = String(text);
             if (cache.shouldSkip(normalized)) {
@@ -328,9 +372,32 @@
             }
         }
 
+        async function performTranslationStream(text, options = {}) {
+            const normalized = String(text);
+            if (cache.shouldSkip(normalized)) {
+                telemetrySafe.logTranslation('skip', normalized, 'trivial text (no letters/already translated)');
+                return normalized;
+            }
+
+            if (isLocalProvider && typeof translateTextStream === 'function') {
+                const id = (++translateSeq) & 0x7FFFFFFF;
+                const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+                diag(`[Translate] #${id} Stream | in="${preview(normalized)}"`);
+                const result = await translateTextStream(normalized, options);
+                const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+                const timing = Math.round(end - start);
+                diag(`[Translate] #${id} OK ${timing}ms | out="${preview(result)}"`);
+                return result || normalized;
+            }
+
+            return performTranslation(normalized);
+        }
+
         cache.shouldSkip = shouldSkip;
         cache.requestTranslation = requestTranslation;
+        cache.requestTranslationStream = requestTranslationStream;
         cache.performTranslation = performTranslation;
+        cache.performTranslationStream = performTranslationStream;
 
         return cache;
     }
@@ -367,6 +434,10 @@
             getCacheEntryLimit,
             pruneMapToLimit,
             translatorBatcher,
+            translateTextStream: textProcessor && typeof textProcessor.translateTextStream === 'function'
+                ? textProcessor.translateTextStream.bind(textProcessor)
+                : null,
+            isLocalProvider,
             diag,
             settings,
         });

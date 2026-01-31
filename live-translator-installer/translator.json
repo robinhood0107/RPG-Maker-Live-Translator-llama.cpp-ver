@@ -4,7 +4,7 @@
         "local": {
             "address": "127.0.0.1",
             "port": 1234,
-            "model": "yanoljanext-rosetta-27b-2511-i1@iq3_m",
+            "model": "yanoljanext-rosetta-27b-2511@iq3_s",
             "system_prompt": "Translate the user's text into accurate and natural Korean.\nContext: Novel, video games and UI\nTranslate each line corresponding to the keys. IMPORTANT: Do not omit or modify control codes like ⟦TAG0⟧; leave them in place.\nOutput JSON in the same structure.",
             "separate_multiline_requests": true,
             "temperature": 0.7,

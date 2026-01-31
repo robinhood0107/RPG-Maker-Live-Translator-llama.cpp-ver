@@ -7,7 +7,7 @@
             "command": "bash",
             "args": [
                 "-c",
-                "cp -r \"${workspaceFolder}/live-translator-installer\" \"${workspaceFolder}/${input:experimentationFolder}/\" && cd \"${workspaceFolder}/${input:experimentationFolder}\" && ./live-translator-installer/install"
+                "cp -r \"${workspaceFolder}/live-translator-installer\" \"${workspaceFolder}/${input:experimentationFolder}/\" && cd \"${workspaceFolder}/${input:experimentationFolder}\" && cp \"./live-translator-installer/translator.dev.json\" \"./live-translator-installer/translator.json\" && cp \"./live-translator-installer/settings.dev.json\" \"./live-translator-installer/settings.json\" && ./live-translator-installer/install; status=$?; rm -f \"./live-translator-installer/translator.json\" \"./live-translator-installer/settings.json\"; exit $status"
             ],
             "group": "build",
             "options": { "cwd": "${workspaceFolder}" },
@@ -23,7 +23,7 @@
                 "args": [
                     "-ExecutionPolicy", "Bypass",
                     "-Command",
-                    "Copy-Item .\\live-translator-installer -Destination .\\${input:experimentationFolder} -Recurse -Force; Set-Location -LiteralPath .\\${input:experimentationFolder}; .\\live-translator-installer\\installer.ps1"
+                    "Copy-Item .\\live-translator-installer -Destination .\\${input:experimentationFolder} -Recurse -Force; Set-Location -LiteralPath .\\${input:experimentationFolder}; Copy-Item .\\live-translator-installer\\translator.dev.json .\\live-translator-installer\\translator.json -Force; Copy-Item .\\live-translator-installer\\settings.dev.json .\\live-translator-installer\\settings.json -Force; try { .\\live-translator-installer\\installer.ps1; $exitCode = $LASTEXITCODE } finally { Remove-Item .\\live-translator-installer\\translator.json, .\\live-translator-installer\\settings.json -Force -ErrorAction SilentlyContinue }; exit $exitCode"
                 ]
             }
         }

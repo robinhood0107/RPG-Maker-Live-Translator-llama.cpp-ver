@@ -41,4 +41,6 @@ Since RPG Maker is a scriptable platform, no implementation of a translator will
 
 1.4 - fix some duplicate texts, support control codes, and prevent bitmap level detection on main game message
 
+1.6 - update to LM Studio REST API v1 - supports response streaming
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

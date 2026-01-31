@@ -30,6 +30,13 @@
             }
         },
 
+        async translateTextStream(text, options = {}) {
+            if (TRANSLATOR_CONFIG.provider !== 'local') {
+                throw new Error('Streaming translation is only supported for the local provider.');
+            }
+            return translateOneLocalStream(String(text), TRANSLATOR_CONFIG.settings.local, options);
+        },
+
         async translateMany(texts, targetLang = null) {
             const items = Array.isArray(texts) ? texts : [texts];
             try {
@@ -148,7 +155,6 @@
     }
 
     async function translateOneLocal(text, cfg) {
-        const url = `http://${cfg.address}:${cfg.port}/v1/chat/completions`;
         const sourceText = String(text ?? '');
         const lines = sourceText.split(/\r?\n/);
 
@@ -160,29 +166,80 @@
             return perLine.join('\n');
         }
 
+        const { body } = buildLocalChatBody(sourceText, cfg, false);
+        const data = await requestLocalChat(body, cfg);
+
+        const messageContent = extractMessageContentFromV1(data);
+        return parseLocalJsonOutput(messageContent, sourceText);
+    }
+
+    async function translateOneLocalStream(text, cfg, options = {}) {
+        const sourceText = String(text ?? '');
+        const lines = sourceText.split(/\r?\n/);
+        const onDelta = typeof options.onDelta === 'function' ? options.onDelta : null;
+        const signal = options.signal;
+
+        if (cfg && cfg.separate_multiline_requests && lines.length > 1) {
+            const outputs = new Array(lines.length);
+            const tasks = lines.map((line, idx) => {
+                if (!line) {
+                    outputs[idx] = '';
+                    return Promise.resolve('');
+                }
+                return translateOneLocalStream(line, { ...cfg, separate_multiline_requests: false }, {
+                    signal,
+                    onDelta: (partial) => {
+                        outputs[idx] = partial || '';
+                        if (onDelta) onDelta(outputs.join('\n'));
+                    }
+                }).then((finalLine) => {
+                    outputs[idx] = finalLine || '';
+                    return finalLine;
+                });
+            });
+            const finalLines = await Promise.all(tasks);
+            return finalLines.join('\n');
+        }
+
+        const { body } = buildLocalChatBody(sourceText, cfg, true);
+        const streamResult = await requestLocalChatStream(body, cfg, onDelta, signal);
+        const messageContent = streamResult && streamResult.finalMessage
+            ? streamResult.finalMessage
+            : streamResult && streamResult.accumulatedMessage
+                ? streamResult.accumulatedMessage
+                : '';
+        return parseLocalJsonOutput(messageContent, sourceText);
+    }
+
+    function buildLocalChatBody(sourceText, cfg, stream) {
+        const lines = String(sourceText ?? '').split(/\r?\n/);
         const textMap = {};
         for (let i = 0; i < lines.length; i += 1) {
             textMap[String(i + 1)] = lines[i];
         }
         const userPayload = textMap;
         const systemPrompt = typeof cfg.system_prompt === 'string' ? cfg.system_prompt : '';
-        const messages = [];
-        if (systemPrompt) {
-            messages.push({ role: 'system', content: systemPrompt });
-        }
-        messages.push({ role: 'user', content: JSON.stringify(userPayload) });
-
         const body = {
             model: cfg.model,
-            messages,
-            temperature: cfg.temperature,
-            top_p: cfg.top_p,
-            top_k: cfg.top_k,
-            min_p: cfg.min_p,
-            repetition_penalty: cfg.repeat_penalty,
-            max_tokens: cfg.max_tokens || 256
+            input: JSON.stringify(userPayload),
+            stream: !!stream,
+            store: false
         };
+        if (systemPrompt) body.system_prompt = systemPrompt;
+        if (Number.isFinite(cfg.temperature)) body.temperature = cfg.temperature;
+        if (Number.isFinite(cfg.top_p)) body.top_p = cfg.top_p;
+        if (Number.isFinite(cfg.top_k)) body.top_k = cfg.top_k;
+        if (Number.isFinite(cfg.min_p)) body.min_p = cfg.min_p;
+        if (Number.isFinite(cfg.repeat_penalty)) body.repeat_penalty = cfg.repeat_penalty;
+        const maxOut = Number.isFinite(cfg.max_output_tokens)
+            ? cfg.max_output_tokens
+            : (Number.isFinite(cfg.max_tokens) ? cfg.max_tokens : 256);
+        body.max_output_tokens = maxOut;
+        return { body };
+    }
 
+    async function requestLocalChat(body, cfg) {
+        const url = `http://${cfg.address}:${cfg.port}/api/v1/chat`;
         let resp;
         try {
             resp = await fetch(url, {
@@ -193,21 +250,83 @@
         } catch (e) {
             throw new Error(`Local LLM request failed: ${e && e.message ? e.message : e}`);
         }
-
         if (!resp || !resp.ok) {
             const status = resp ? `${resp.status} ${resp.statusText}` : 'no response';
             throw new Error(`Local LLM error: ${status}`);
         }
+        return resp.json();
+    }
 
-        const data = await resp.json();
+    async function requestLocalChatStream(body, cfg, onDelta, signal) {
+        const url = `http://${cfg.address}:${cfg.port}/api/v1/chat`;
+        let resp;
         try {
-            const choice = data && data.choices && data.choices[0];
-            const content = choice && choice.message && typeof choice.message.content === 'string'
-                ? choice.message.content
-                : (choice && typeof choice.text === 'string' ? choice.text : '');
+            resp = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal
+            });
+        } catch (e) {
+            throw new Error(`Local LLM request failed: ${e && e.message ? e.message : e}`);
+        }
+        if (!resp || !resp.ok) {
+            const status = resp ? `${resp.status} ${resp.statusText}` : 'no response';
+            throw new Error(`Local LLM error: ${status}`);
+        }
+        if (!resp.body || typeof resp.body.getReader !== 'function') {
+            throw new Error('Local LLM streaming unavailable: response body missing.');
+        }
 
+        const decoder = new TextDecoder('utf-8');
+        const reader = resp.body.getReader();
+        const sse = createSseParser();
+        const jsonParser = createJsonTextMapStreamParser();
+        const thinkStripper = createThinkBlockStripper();
+        let accumulatedMessage = '';
+        let finalMessage = '';
+        let lastPartial = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            const events = sse.feed(chunk);
+            for (const evt of events) {
+                if (!evt) continue;
+                if (evt.type === 'message.delta' && typeof evt.content === 'string') {
+                    const cleaned = thinkStripper.feed(evt.content);
+                    if (cleaned) {
+                        accumulatedMessage += cleaned;
+                        jsonParser.feed(cleaned);
+                        if (onDelta) {
+                            const partial = jsonParser.getValue('1');
+                            if (partial !== null && partial !== undefined && partial !== lastPartial) {
+                                lastPartial = partial;
+                                onDelta(partial);
+                            }
+                        }
+                    }
+                } else if (evt.type === 'chat.end' && evt.result) {
+                    finalMessage = extractMessageContentFromV1(evt.result);
+                }
+            }
+        }
+
+        return { accumulatedMessage, finalMessage };
+    }
+
+    function extractMessageContentFromV1(data) {
+        const output = data && Array.isArray(data.output)
+            ? data.output
+            : (data && data.result && Array.isArray(data.result.output) ? data.result.output : []);
+        const messages = output.filter((item) => item && item.type === 'message' && typeof item.content === 'string');
+        return messages.map((item) => item.content).join('');
+    }
+
+    function parseLocalJsonOutput(content, sourceText) {
+        try {
             const sanitized = sanitizeLocalOutput(String(content || ''));
-
             let parsed = null;
             try {
                 parsed = JSON.parse(sanitized);
@@ -215,7 +334,7 @@
                 parsed = null;
             }
 
-            const originalLines = sourceText.split(/\r?\n/);
+            const originalLines = String(sourceText || '').split(/\r?\n/);
             if (parsed && typeof parsed === 'object') {
                 const container = parsed && typeof parsed.text === 'object'
                     ? parsed.text
@@ -227,12 +346,254 @@
                 });
                 return outLines.join('\n');
             }
-
             return sanitized;
         } catch (e) {
             console.error('[Local LLM] Parse error:', e);
             return '';
         }
+    }
+
+    function createThinkBlockStripper() {
+        const state = { inThink: false };
+        return {
+            feed(chunk) {
+                const input = String(chunk || '');
+                if (!input) return '';
+                const lowerInput = input.toLowerCase();
+                let out = '';
+                let i = 0;
+                while (i < input.length) {
+                    if (!state.inThink) {
+                        const idx = lowerInput.indexOf('<think', i);
+                        if (idx === -1) {
+                            out += input.slice(i);
+                            break;
+                        }
+                        out += input.slice(i, idx);
+                        const endTag = input.indexOf('>', idx);
+                        if (endTag === -1) {
+                            state.inThink = true;
+                            break;
+                        }
+                        state.inThink = true;
+                        i = endTag + 1;
+                    } else {
+                        const endIdx = lowerInput.indexOf('</think', i);
+                        if (endIdx === -1) {
+                            break;
+                        }
+                        const endTag = input.indexOf('>', endIdx);
+                        if (endTag === -1) {
+                            break;
+                        }
+                        state.inThink = false;
+                        i = endTag + 1;
+                    }
+                }
+                return out;
+            }
+        };
+    }
+
+    function createSseParser() {
+        let buffer = '';
+        return {
+            feed(chunk) {
+                buffer += String(chunk || '');
+                const events = [];
+                while (true) {
+                    const match = buffer.match(/\r?\n\r?\n/);
+                    if (!match) break;
+                    const idx = match.index;
+                    const raw = buffer.slice(0, idx);
+                    buffer = buffer.slice(idx + match[0].length);
+                    const lines = raw.split(/\r?\n/);
+                    const dataLines = [];
+                    for (const line of lines) {
+                        if (line.startsWith('data:')) {
+                            dataLines.push(line.slice(5).trimStart());
+                        }
+                    }
+                    if (!dataLines.length) continue;
+                    const dataStr = dataLines.join('\n');
+                    try {
+                        const obj = JSON.parse(dataStr);
+                        events.push(obj);
+                    } catch (_) {
+                        // ignore malformed event
+                    }
+                }
+                return events;
+            }
+        };
+    }
+
+    function createJsonTextMapStreamParser() {
+        const rootValues = new Map();
+        const textValues = new Map();
+        const rootPartials = new Map();
+        const textPartials = new Map();
+        const contexts = [{ key: null, isText: false, pendingKey: null, expectingValue: false }];
+        let buffer = '';
+        let index = 0;
+        let inString = false;
+        let stringIsValue = false;
+        let currentString = '';
+        let escape = false;
+        let unicode = null;
+        let activeValueKey = null;
+        let activeValueIsText = false;
+
+        const currentContext = () => contexts[contexts.length - 1];
+        const setPartial = (key, value, isText) => {
+            const map = isText ? textPartials : rootPartials;
+            map.set(key, value);
+        };
+        const setValue = (key, value, isText) => {
+            const map = isText ? textValues : rootValues;
+            map.set(key, value);
+            const p = isText ? textPartials : rootPartials;
+            p.delete(key);
+        };
+
+        const appendChar = (ch) => {
+            currentString += ch;
+            if (stringIsValue && activeValueKey) {
+                setPartial(activeValueKey, currentString, activeValueIsText);
+            }
+        };
+
+        const finishString = () => {
+            if (!stringIsValue) {
+                const ctx = currentContext();
+                ctx.pendingKey = currentString;
+            } else if (activeValueKey) {
+                setValue(activeValueKey, currentString, activeValueIsText);
+            }
+            currentString = '';
+            stringIsValue = false;
+            activeValueKey = null;
+            activeValueIsText = false;
+        };
+
+        const decodeEscape = (ch) => {
+            switch (ch) {
+                case '"': return '"';
+                case '\\': return '\\';
+                case '/': return '/';
+                case 'b': return '\b';
+                case 'f': return '\f';
+                case 'n': return '\n';
+                case 'r': return '\r';
+                case 't': return '\t';
+                default: return ch;
+            }
+        };
+
+        const feed = (chunk) => {
+            buffer += String(chunk || '');
+            for (; index < buffer.length; index += 1) {
+                const ch = buffer[index];
+                if (inString) {
+                    if (escape) {
+                        if (unicode !== null) {
+                            if (/^[0-9a-fA-F]$/.test(ch)) {
+                                unicode += ch;
+                                if (unicode.length === 4) {
+                                    const code = parseInt(unicode, 16);
+                                    if (Number.isFinite(code)) {
+                                        appendChar(String.fromCharCode(code));
+                                    }
+                                    unicode = null;
+                                    escape = false;
+                                }
+                            } else {
+                                unicode = null;
+                                escape = false;
+                                appendChar(ch);
+                            }
+                        } else if (ch === 'u') {
+                            unicode = '';
+                        } else {
+                            appendChar(decodeEscape(ch));
+                            escape = false;
+                        }
+                        continue;
+                    }
+                    if (ch === '\\') {
+                        escape = true;
+                        continue;
+                    }
+                    if (ch === '"') {
+                        inString = false;
+                        finishString();
+                        continue;
+                    }
+                    appendChar(ch);
+                    continue;
+                }
+
+                if (ch === '"') {
+                    const ctx = currentContext();
+                    inString = true;
+                    stringIsValue = !!ctx.expectingValue;
+                    if (stringIsValue) {
+                        activeValueKey = ctx.pendingKey;
+                        activeValueIsText = !!ctx.isText;
+                        ctx.pendingKey = null;
+                        ctx.expectingValue = false;
+                    }
+                    continue;
+                }
+
+                if (ch === ':') {
+                    const ctx = currentContext();
+                    ctx.expectingValue = true;
+                    continue;
+                }
+
+                if (ch === '{') {
+                    const parent = currentContext();
+                    const newKey = parent.pendingKey;
+                    const isText = (newKey === 'text') || parent.isText;
+                    contexts.push({ key: newKey, isText, pendingKey: null, expectingValue: false });
+                    parent.pendingKey = null;
+                    parent.expectingValue = false;
+                    continue;
+                }
+
+                if (ch === '}') {
+                    contexts.pop();
+                    if (!contexts.length) {
+                        contexts.push({ key: null, isText: false, pendingKey: null, expectingValue: false });
+                    }
+                    continue;
+                }
+
+                if (ch === ',') {
+                    const ctx = currentContext();
+                    ctx.pendingKey = null;
+                    ctx.expectingValue = false;
+                    continue;
+                }
+            }
+
+            if (index > 2048) {
+                buffer = buffer.slice(index);
+                index = 0;
+            }
+        };
+
+        const getValue = (key) => {
+            const k = String(key);
+            if (textPartials.has(k)) return textPartials.get(k);
+            if (textValues.has(k)) return textValues.get(k);
+            if (rootPartials.has(k)) return rootPartials.get(k);
+            if (rootValues.has(k)) return rootValues.get(k);
+            return '';
+        };
+
+        return { feed, getValue };
     }
 
     // Remove control-code style XML-ish blocks some local LLMs emit
