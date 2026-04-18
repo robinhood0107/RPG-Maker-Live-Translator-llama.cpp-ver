@@ -949,12 +949,26 @@
                         entries: new Map(),
                         flushTimer: null,
                         instanceMap: new Map(),
+                        renderOps: [],
+                        drawOrderCounter: 0,
                     };
                     bitmapStates.set(bitmap, state);
                 } else if (!state.instanceMap) {
                     state.instanceMap = new Map();
                 }
+                if (!Array.isArray(state.renderOps)) {
+                    state.renderOps = [];
+                }
+                if (!Number.isFinite(state.drawOrderCounter)) {
+                    state.drawOrderCounter = 0;
+                }
                 return state;
+            };
+
+            const nextDrawOrder = (state) => {
+                if (!state) return 0;
+                state.drawOrderCounter = (state.drawOrderCounter || 0) + 1;
+                return state.drawOrderCounter;
             };
 
             const estimateWidth = (bitmap, text, maxWidth) => {
@@ -1001,6 +1015,129 @@
                     ].join('|');
                 }
                 return 'default';
+            };
+
+            const discardRenderOpsInRect = (state, rect) => {
+                if (!state || !Array.isArray(state.renderOps) || state.renderOps.length === 0) return;
+                if (!rect || !isValidRect(rect)) {
+                    state.renderOps.length = 0;
+                    return;
+                }
+                state.renderOps = state.renderOps.filter((op) => !op || !op.rect || !rectanglesOverlap(rect, op.rect));
+            };
+
+            const recordBitmapRenderOp = (bitmap, op) => {
+                if (!bitmap || !op || !op.methodName) return null;
+                const state = ensureBitmapState(bitmap);
+                if (!state) return null;
+                const rect = op.fullBitmap
+                    ? rectFromDimensions(0, 0, bitmap.width, bitmap.height)
+                    : op.rect;
+                if (!rect || !isValidRect(rect)) return null;
+                const record = {
+                    methodName: op.methodName,
+                    args: Array.isArray(op.args) ? op.args.slice() : [],
+                    rect,
+                    drawOrder: nextDrawOrder(state),
+                    recordedAt: Date.now(),
+                };
+                state.renderOps.push(record);
+                if (state.renderOps.length > 256) {
+                    state.renderOps.splice(0, state.renderOps.length - 256);
+                }
+                return record;
+            };
+
+            const withBitmapReplay = (bitmap, fn) => {
+                if (!bitmap || typeof fn !== 'function') return undefined;
+                bitmap._trBitmapReplayDepth = (bitmap._trBitmapReplayDepth || 0) + 1;
+                try {
+                    return fn();
+                } finally {
+                    bitmap._trBitmapReplayDepth = Math.max(0, (bitmap._trBitmapReplayDepth || 1) - 1);
+                }
+            };
+
+            const drawBitmapTextValue = (bitmap, entry, text) => {
+                if (!bitmap || !entry || typeof text !== 'string' || !text) return;
+                try { applyBitmapDrawState(bitmap, entry.drawState); } catch (_) {}
+                const drawMethodName = entry.methodName && typeof bitmap[entry.methodName] === 'function'
+                    ? entry.methodName
+                    : 'drawText';
+                const drawFn = bitmap[drawMethodName] || bitmap.drawText;
+                if (typeof drawFn !== 'function') return;
+                drawFn.call(
+                    bitmap,
+                    text,
+                    entry.drawParams.x,
+                    entry.drawParams.y,
+                    entry.drawParams.maxWidth,
+                    entry.drawParams.lineHeight,
+                    entry.drawParams.align
+                );
+            };
+
+            const replayBitmapEntry = (bitmap, entry) => {
+                if (!bitmap || !entry || entry._trStale) return;
+                const text = entry.translationStatus === 'completed' && entry.translatedText
+                    ? entry.translatedText
+                    : entry.rawText;
+                drawBitmapTextValue(bitmap, entry, text);
+            };
+
+            const replayBitmapRenderOp = (bitmap, op) => {
+                if (!bitmap || !op || !op.methodName) return;
+                switch (op.methodName) {
+                case 'fillRect':
+                    if (typeof bitmap.fillRect === 'function') bitmap.fillRect(...op.args);
+                    break;
+                case 'gradientFillRect':
+                    if (typeof bitmap.gradientFillRect === 'function') bitmap.gradientFillRect(...op.args);
+                    break;
+                case 'fillAll':
+                    if (typeof bitmap.fillAll === 'function') bitmap.fillAll(...op.args);
+                    break;
+                case 'blt':
+                    if (typeof bitmap.blt === 'function') bitmap.blt(...op.args);
+                    break;
+                default:
+                    break;
+                }
+            };
+
+            const collectReplayItems = (state, rect, currentEntry, relation) => {
+                if (!state || !rect || !isValidRect(rect) || typeof relation !== 'function') return [];
+                const items = [];
+                if (Array.isArray(state.renderOps)) {
+                    state.renderOps.forEach((op) => {
+                        if (!op || !op.rect || !rectanglesOverlap(rect, op.rect)) return;
+                        if (!relation(op.drawOrder || 0)) return;
+                        items.push({ type: 'renderOp', drawOrder: op.drawOrder || 0, op });
+                    });
+                }
+                if (state.entries && typeof state.entries.forEach === 'function') {
+                    state.entries.forEach((entry) => {
+                        if (!entry || entry === currentEntry || entry._trStale) return;
+                        const entryRect = deriveEntryRect(entry);
+                        if (!entryRect || !rectanglesOverlap(rect, entryRect)) return;
+                        if (!relation(entry.drawOrder || 0)) return;
+                        items.push({ type: 'text', drawOrder: entry.drawOrder || 0, entry });
+                    });
+                }
+                items.sort((a, b) => (a.drawOrder || 0) - (b.drawOrder || 0));
+                return items;
+            };
+
+            const replayBitmapItems = (bitmap, items) => {
+                if (!bitmap || !Array.isArray(items) || items.length === 0) return;
+                items.forEach((item) => {
+                    if (!item) return;
+                    if (item.type === 'renderOp') {
+                        replayBitmapRenderOp(bitmap, item.op);
+                    } else if (item.type === 'text') {
+                        replayBitmapEntry(bitmap, item.entry);
+                    }
+                });
             };
 
             const pushInvalidationGuard = (bitmap, guard) => {
@@ -1200,12 +1337,26 @@
                         }
                     } catch (_) {}
                     const result = original.apply(this, args);
+                    if (this && this._trBitmapReplayDepth && this._trBitmapReplayDepth > 0) {
+                        return result;
+                    }
                     if (rect !== false) {
                         let resolvedRect = null;
                         if (rect === 'FULL') {
                             resolvedRect = null;
                         } else {
                             resolvedRect = rect;
+                        }
+                        if (extraOptions && extraOptions.clearRenderOps) {
+                            const state = bitmapStates.get(this);
+                            if (state) {
+                                discardRenderOpsInRect(
+                                    state,
+                                    extraOptions.clearRenderOps === 'all'
+                                        ? null
+                                        : (resolvedRect && isValidRect(resolvedRect) ? resolvedRect : null)
+                                );
+                            }
                         }
                         const guard = resolvedRect ? consumeInvalidationGuard(this, resolvedRect, methodName) : null;
                         if (guard) {
@@ -1216,6 +1367,13 @@
                             }
                         } else {
                             handleBitmapInvalidation(this, resolvedRect && isValidRect(resolvedRect) ? resolvedRect : null, methodName, extraOptions);
+                        }
+                        if (extraOptions && extraOptions.recordOp) {
+                            const op = Object.assign({}, extraOptions.recordOp);
+                            if (!op.rect && resolvedRect) {
+                                op.rect = resolvedRect;
+                            }
+                            recordBitmapRenderOp(this, op);
                         }
                     }
                     return result;
@@ -1229,29 +1387,59 @@
 
             installInvalidationHook('clearRect', function(args) {
                 const [x, y, w, h] = args;
-                return rectOrFalse(rectFromDimensions(x, y, w, h));
+                return {
+                    rect: rectOrFalse(rectFromDimensions(x, y, w, h)),
+                    options: { clearRenderOps: 'rect' },
+                };
             });
 
             installInvalidationHook('clear', function() {
-                return 'FULL';
+                return {
+                    rect: 'FULL',
+                    options: { clearRenderOps: 'all' },
+                };
             });
 
             installInvalidationHook('fillRect', function(args) {
-                const [x, y, w, h] = args;
-                return rectOrFalse(rectFromDimensions(x, y, w, h));
+                const [x, y, w, h, color] = args;
+                return {
+                    rect: rectOrFalse(rectFromDimensions(x, y, w, h)),
+                    options: {
+                        recordOp: {
+                            methodName: 'fillRect',
+                            args: [x, y, w, h, color],
+                        },
+                    },
+                };
             });
 
             installInvalidationHook('gradientFillRect', function(args) {
-                const [x, y, w, h] = args;
-                return rectOrFalse(rectFromDimensions(x, y, w, h));
+                const [x, y, w, h, color1, color2, vertical] = args;
+                return {
+                    rect: rectOrFalse(rectFromDimensions(x, y, w, h)),
+                    options: {
+                        recordOp: {
+                            methodName: 'gradientFillRect',
+                            args: [x, y, w, h, color1, color2, vertical],
+                        },
+                    },
+                };
             });
 
-            installInvalidationHook('fillAll', function() {
-                return 'FULL';
+            installInvalidationHook('fillAll', function(args) {
+                return {
+                    rect: 'FULL',
+                    options: {
+                        clearRenderOps: 'all',
+                    },
+                };
             });
 
             installInvalidationHook('resize', function() {
-                return 'FULL';
+                return {
+                    rect: 'FULL',
+                    options: { clearRenderOps: 'all' },
+                };
             });
 
             installInvalidationHook('blt', function(args) {
@@ -1260,7 +1448,13 @@
                 const height = Number.isFinite(Number(dh)) ? dh : sh;
                 return {
                     rect: rectOrFalse(rectFromDimensions(dx, dy, width, height)),
-                    options: { skipEntryInvalidation: true },
+                    options: {
+                        skipEntryInvalidation: true,
+                        recordOp: {
+                            methodName: 'blt',
+                            args: Array.isArray(args) ? args.slice() : [],
+                        },
+                    },
                 };
             });
 
@@ -1424,6 +1618,16 @@
                 const existing = state.entries.get(key);
                 if (existing && existing.trimmedText === entry.trimmedText) {
                     existing.detectedAt = Date.now();
+                    existing.rawText = entry.rawText;
+                    existing.visibleText = entry.visibleText;
+                    existing.convertedText = entry.convertedText;
+                    existing.drawParams = entry.drawParams;
+                    existing.bounds = entry.bounds;
+                    existing.drawState = entry.drawState;
+                    existing.fragments = entry.fragments;
+                    existing.position = entry.position;
+                    existing.methodName = entry.methodName;
+                    existing.drawOrder = nextDrawOrder(state);
                     diag(`[bitmap/entry-skip] Duplicate text at key=${key} text="${preview(entry.trimmedText)}"`);
                     return;
                 }
@@ -1432,11 +1636,17 @@
                 }
 
                 const normalized = entry.trimmedText;
+                entry.drawOrder = nextDrawOrder(state);
+                entry.isTranslatable = false;
+                entry.translationStatus = 'skipped';
+                state.entries.set(key, entry);
                 if (!normalized || skipLikeCounter(normalized) || translationCache.shouldSkip(normalized)) {
                     diag(`[bitmap/skip] "${preview(normalized)}" flagged as counter/skip.`);
                     return;
                 }
 
+                entry.isTranslatable = true;
+                entry.translationStatus = 'pending';
                 entry.placeholderInfo = prepareTextForTranslation(entry.rawText);
                 entry.translationSource = entry.placeholderInfo
                     ? entry.placeholderInfo.textForTranslation
@@ -1444,6 +1654,8 @@
                 entry.normalizedSource = String(entry.translationSource || '').trim();
                 if (!entry.normalizedSource) {
                     diag('[bitmap/skip] Empty normalized source after preparation.');
+                    entry.isTranslatable = false;
+                    entry.translationStatus = 'skipped';
                     return;
                 }
 
@@ -1456,8 +1668,6 @@
                     fragments: entry.fragments.length,
                 });
                 diag(`[bitmap/register] uuid=${entry.instanceId} key=${key} text="${preview(normalized)}" fragments=${entry.fragments.length}`);
-
-                state.entries.set(key, entry);
                 if (state.instanceMap) {
                     state.instanceMap.set(entry.instanceId, entry);
                 }
@@ -1517,43 +1727,31 @@
                     const outlinePadding = entry.drawState && Number.isFinite(entry.drawState.outlineWidth)
                         ? Math.max(1, entry.drawState.outlineWidth + 1)
                         : 2;
-                    let clearGuard = null;
                     const clearRect = calculateClearRect(bitmap, entry, outlinePadding);
-                    if (clearRect && clearRect.width > 0 && clearRect.height > 0) {
-                        const guardRect = rectFromDimensions(clearRect.x, clearRect.y, clearRect.width, clearRect.height);
-                        clearGuard = pushInvalidationGuard(bitmap, { rect: guardRect, method: 'clearRect', entry });
-                        try { bitmap.clearRect(clearRect.x, clearRect.y, clearRect.width, clearRect.height); } catch (_) {}
-                        popInvalidationGuard(bitmap, clearGuard);
-                    }
-
-                    try { applyBitmapDrawState(bitmap, entry.drawState); } catch (_) {}
-
-                    const signed = REDRAW_SIGNATURE + restored;
-                    const drawMethodName = entry.methodName && typeof bitmap[entry.methodName] === 'function'
-                        ? entry.methodName
-                        : 'drawText';
-                    const drawFn = bitmap[drawMethodName] || bitmap.drawText;
-                    diag(`[bitmap/redraw] key=${entry.key} src=${source} uuid=${entry.instanceId} method=${drawMethodName} "${preview(entry.trimmedText)}" -> "${preview(restoredTrimmed)}"`);
+                    const guardRect = clearRect && clearRect.width > 0 && clearRect.height > 0
+                        ? rectFromDimensions(clearRect.x, clearRect.y, clearRect.width, clearRect.height)
+                        : null;
+                    const currentOrder = entry.drawOrder || 0;
+                    const replayBefore = guardRect
+                        ? collectReplayItems(state, guardRect, entry, order => order < currentOrder)
+                        : [];
+                    const replayAfter = guardRect
+                        ? collectReplayItems(state, guardRect, entry, order => order > currentOrder)
+                        : [];
+                    diag(`[bitmap/redraw] key=${entry.key} src=${source} uuid=${entry.instanceId} method=${entry.methodName || 'drawText'} "${preview(entry.trimmedText)}" -> "${preview(restoredTrimmed)}"`);
                     telemetry.logDraw('bitmap_redraw', restoredTrimmed, entry.drawParams.x, entry.drawParams.y, {
                         ownerType: entry.ownerType,
                         source,
-                        method: drawMethodName,
+                        method: entry.methodName || 'drawText',
                     });
-
-                    bitmap._trBitmapSkipDepth = (bitmap._trBitmapSkipDepth || 0) + 1;
-                    try {
-                        drawFn.call(
-                            bitmap,
-                            signed,
-                            entry.drawParams.x,
-                            entry.drawParams.y,
-                            entry.drawParams.maxWidth,
-                            entry.drawParams.lineHeight,
-                            entry.drawParams.align
-                        );
-                    } finally {
-                        bitmap._trBitmapSkipDepth = Math.max(0, (bitmap._trBitmapSkipDepth || 1) - 1);
-                    }
+                    withBitmapReplay(bitmap, () => {
+                        if (clearRect && clearRect.width > 0 && clearRect.height > 0) {
+                            try { bitmap.clearRect(clearRect.x, clearRect.y, clearRect.width, clearRect.height); } catch (_) {}
+                        }
+                        replayBitmapItems(bitmap, replayBefore);
+                        drawBitmapTextValue(bitmap, entry, restored);
+                        replayBitmapItems(bitmap, replayAfter);
+                    });
                 } finally {
                     bitmap._trActiveRedrawEntry = prevActiveEntry;
                 }
@@ -1576,6 +1774,10 @@
                     const cleanText = textStr.substring(REDRAW_SIGNATURE.length);
                     diag(`[bitmap/bypass:${methodName}] Signed input "${preview(cleanText)}" at (${rawX},${rawY})`);
                     callArgs[0] = cleanText;
+                    return originalFn.apply(bitmap, callArgs);
+                }
+
+                if (bitmap && bitmap._trBitmapReplayDepth && bitmap._trBitmapReplayDepth > 0) {
                     return originalFn.apply(bitmap, callArgs);
                 }
 

@@ -41,4 +41,6 @@ To translate other languages than Chinese, Japanese, or Korean, set `"disableCjk
 
 1.7 - move to Gemma 4 and fix game dependent crashes
 
+1.8 - fix bitmap redraw clearing out graphics
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)
