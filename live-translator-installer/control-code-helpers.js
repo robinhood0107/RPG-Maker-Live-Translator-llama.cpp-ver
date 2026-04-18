@@ -35,9 +35,22 @@
         return String(input).replace(createControlCodeRegex(), '');
     }
 
-    // Replace escape codes with placeholders before sending text to translation.
+    // For the local LLM path, send the original text through unchanged so the model
+    // sees the same control codes RPG Maker will ultimately render.
+    // Other providers still receive placeholder tokens so we can restore codes later.
     function prepareTextForTranslation(input) {
         const original = String(input || '');
+        const provider = getActiveProvider();
+        if (provider === 'local') {
+            return {
+                textForTranslation: original,
+                placeholders: [],
+                newlineData: null,
+                original,
+                preservesControlCodes: true,
+            };
+        }
+
         const placeholders = [];
         let controlIdx = 0;
         const withoutControlCodes = original.replace(createControlCodeRegex(), () => {
@@ -45,19 +58,6 @@
             placeholders.push(token);
             return token;
         });
-
-        const provider = getActiveProvider();
-
-        if (provider === 'local') {
-            const newlineData = {
-                tokens: [],
-                values: [],
-                positions: [],
-                baseLength: 0,
-            };
-            const textForTranslation = withoutControlCodes;
-            return { textForTranslation, placeholders, newlineData, original };
-        }
 
         const newlineData = {
             tokens: [],
@@ -89,7 +89,13 @@
         processedNonNewline += withoutControlCodes.length - lastIndex;
         newlineData.baseLength = processedNonNewline;
 
-        return { textForTranslation, placeholders, newlineData, original };
+        return {
+            textForTranslation,
+            placeholders,
+            newlineData,
+            original,
+            preservesControlCodes: false,
+        };
     }
 
     // Reinsert the original escape codes into a translated string.
@@ -117,6 +123,10 @@
             : null;
 
         let output = String(translated);
+
+        if (info && info.preservesControlCodes) {
+            return clampConsecutiveNewlines(output);
+        }
 
         if (newlineTokens.length) {
             const missingInserts = [];

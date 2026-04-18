@@ -116,6 +116,13 @@
         return count;
     };
 
+    const isAbortErrorLike = (error) => {
+        if (!error) return false;
+        if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
+        const message = typeof error.message === 'string' ? error.message : String(error);
+        return /\bAbortError\b/i.test(message) || /\baborted\b/i.test(message);
+    };
+
     function normalizePlaceholdersForRestore(text, placeholders) {
         if (!placeholders || !placeholders.length) return null;
         let output = String(text || '');
@@ -528,7 +535,7 @@
                     redrawMessageText(this, restored, sessionId);
                 })
                 .catch(err => {
-                    if (err && err.name === 'AbortError') return;
+                    if (isAbortErrorLike(err)) return;
                     logger.error('[GameMessage Translation Error]', err);
                 });
         };

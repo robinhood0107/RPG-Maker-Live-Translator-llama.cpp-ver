@@ -4,13 +4,13 @@
         "local": {
             "address": "127.0.0.1",
             "port": 1234,
-            "model": "yanoljanext-rosetta-27b-2511@iq3_s",
-            "system_prompt": "Translate the user's text into accurate and natural Korean.\nContext: Novel, video games and UI\nTranslate each line corresponding to the keys. IMPORTANT: Do not omit or modify control codes like ⟦TAG0⟧; leave them in place.\nOutput JSON in the same structure.",
+            "model": "google_gemma-4-26b-a4b-it",
+            "system_prompt": "Translate the user's text into accurate and natural Korean. Preserve any tags like ⟦TAG0⟧ exactly as written. Return only the translated text.",
             "separate_multiline_requests": true,
-            "temperature": 0.7,
+            "temperature": 1,
             "top_p": 0.95,
             "top_k": 64,
-            "min_p": 0.00,
+            "min_p": 0.05,
             "repeat_penalty": 1.1
         },
         "deepl": {

@@ -119,6 +119,23 @@
         return Number.isFinite(n) ? n : def;
     }
 
+    function isAbortErrorLike(error) {
+        if (!error) return false;
+        if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
+        const message = typeof error.message === 'string' ? error.message : String(error);
+        return /\bAbortError\b/i.test(message) || /\baborted\b/i.test(message);
+    }
+
+    function coerceAbortError(error) {
+        if (!isAbortErrorLike(error)) return null;
+        if (error && error.name === 'AbortError') return error;
+        const message = error && error.message ? error.message : 'The operation was aborted.';
+        const abortError = new Error(message);
+        try { abortError.name = 'AbortError'; } catch (_) {}
+        try { abortError.code = 'ABORT_ERR'; } catch (_) {}
+        return abortError;
+    }
+
     // DeepL implementation (batch)
     async function translateManyDeepL(texts, targetLang, apiKey) {
         try {
@@ -166,11 +183,11 @@
             return perLine.join('\n');
         }
 
-        const { body } = buildLocalChatBody(sourceText, cfg, false);
+        const body = buildLocalChatBody(sourceText, cfg, false);
         const data = await requestLocalChat(body, cfg);
 
         const messageContent = extractMessageContentFromV1(data);
-        return parseLocalJsonOutput(messageContent, sourceText);
+        return parseLocalTextOutput(messageContent);
     }
 
     async function translateOneLocalStream(text, cfg, options = {}) {
@@ -201,27 +218,21 @@
             return finalLines.join('\n');
         }
 
-        const { body } = buildLocalChatBody(sourceText, cfg, true);
+        const body = buildLocalChatBody(sourceText, cfg, true);
         const streamResult = await requestLocalChatStream(body, cfg, onDelta, signal);
         const messageContent = streamResult && streamResult.finalMessage
             ? streamResult.finalMessage
             : streamResult && streamResult.accumulatedMessage
                 ? streamResult.accumulatedMessage
                 : '';
-        return parseLocalJsonOutput(messageContent, sourceText);
+        return parseLocalTextOutput(messageContent);
     }
 
     function buildLocalChatBody(sourceText, cfg, stream) {
-        const lines = String(sourceText ?? '').split(/\r?\n/);
-        const textMap = {};
-        for (let i = 0; i < lines.length; i += 1) {
-            textMap[String(i + 1)] = lines[i];
-        }
-        const userPayload = textMap;
         const systemPrompt = typeof cfg.system_prompt === 'string' ? cfg.system_prompt : '';
         const body = {
             model: cfg.model,
-            input: JSON.stringify(userPayload),
+            input: String(sourceText ?? ''),
             stream: !!stream,
             store: false
         };
@@ -235,7 +246,7 @@
             ? cfg.max_output_tokens
             : (Number.isFinite(cfg.max_tokens) ? cfg.max_tokens : 256);
         body.max_output_tokens = maxOut;
-        return { body };
+        return body;
     }
 
     async function requestLocalChat(body, cfg) {
@@ -268,6 +279,8 @@
                 signal
             });
         } catch (e) {
+            const abortError = coerceAbortError(e);
+            if (abortError) throw abortError;
             throw new Error(`Local LLM request failed: ${e && e.message ? e.message : e}`);
         }
         if (!resp || !resp.ok) {
@@ -281,36 +294,39 @@
         const decoder = new TextDecoder('utf-8');
         const reader = resp.body.getReader();
         const sse = createSseParser();
-        const jsonParser = createJsonTextMapStreamParser();
         const thinkStripper = createThinkBlockStripper();
         let accumulatedMessage = '';
         let finalMessage = '';
         let lastPartial = '';
 
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            const events = sse.feed(chunk);
-            for (const evt of events) {
-                if (!evt) continue;
-                if (evt.type === 'message.delta' && typeof evt.content === 'string') {
-                    const cleaned = thinkStripper.feed(evt.content);
-                    if (cleaned) {
-                        accumulatedMessage += cleaned;
-                        jsonParser.feed(cleaned);
-                        if (onDelta) {
-                            const partial = jsonParser.getValue('1');
-                            if (partial !== null && partial !== undefined && partial !== lastPartial) {
-                                lastPartial = partial;
-                                onDelta(partial);
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                const events = sse.feed(chunk);
+                for (const evt of events) {
+                    if (!evt) continue;
+                    if (evt.type === 'message.delta' && typeof evt.content === 'string') {
+                        const cleaned = thinkStripper.feed(evt.content);
+                        if (cleaned) {
+                            accumulatedMessage += cleaned;
+                            if (onDelta && accumulatedMessage !== lastPartial) {
+                                lastPartial = accumulatedMessage;
+                                onDelta(accumulatedMessage);
                             }
                         }
+                    } else if (evt.type === 'chat.end' && evt.result) {
+                        finalMessage = extractMessageContentFromV1(evt.result);
                     }
-                } else if (evt.type === 'chat.end' && evt.result) {
-                    finalMessage = extractMessageContentFromV1(evt.result);
                 }
             }
+        } catch (e) {
+            const abortError = coerceAbortError(e);
+            if (abortError) throw abortError;
+            throw e;
+        } finally {
+            try { reader.releaseLock(); } catch (_) {}
         }
 
         return { accumulatedMessage, finalMessage };
@@ -324,31 +340,11 @@
         return messages.map((item) => item.content).join('');
     }
 
-    function parseLocalJsonOutput(content, sourceText) {
+    function parseLocalTextOutput(content) {
         try {
-            const sanitized = sanitizeLocalOutput(String(content || ''));
-            let parsed = null;
-            try {
-                parsed = JSON.parse(sanitized);
-            } catch (_) {
-                parsed = null;
-            }
-
-            const originalLines = String(sourceText || '').split(/\r?\n/);
-            if (parsed && typeof parsed === 'object') {
-                const container = parsed && typeof parsed.text === 'object'
-                    ? parsed.text
-                    : parsed;
-                const outLines = originalLines.map((line, idx) => {
-                    const key = String(idx + 1);
-                    const v = container && typeof container[key] === 'string' ? container[key] : line;
-                    return v;
-                });
-                return outLines.join('\n');
-            }
-            return sanitized;
+            return sanitizeLocalOutput(String(content || ''));
         } catch (e) {
-            console.error('[Local LLM] Parse error:', e);
+            console.error('[Local LLM] Output sanitize error:', e);
             return '';
         }
     }
@@ -428,175 +424,7 @@
         };
     }
 
-    function createJsonTextMapStreamParser() {
-        const rootValues = new Map();
-        const textValues = new Map();
-        const rootPartials = new Map();
-        const textPartials = new Map();
-        const contexts = [{ key: null, isText: false, pendingKey: null, expectingValue: false }];
-        let buffer = '';
-        let index = 0;
-        let inString = false;
-        let stringIsValue = false;
-        let currentString = '';
-        let escape = false;
-        let unicode = null;
-        let activeValueKey = null;
-        let activeValueIsText = false;
-
-        const currentContext = () => contexts[contexts.length - 1];
-        const setPartial = (key, value, isText) => {
-            const map = isText ? textPartials : rootPartials;
-            map.set(key, value);
-        };
-        const setValue = (key, value, isText) => {
-            const map = isText ? textValues : rootValues;
-            map.set(key, value);
-            const p = isText ? textPartials : rootPartials;
-            p.delete(key);
-        };
-
-        const appendChar = (ch) => {
-            currentString += ch;
-            if (stringIsValue && activeValueKey) {
-                setPartial(activeValueKey, currentString, activeValueIsText);
-            }
-        };
-
-        const finishString = () => {
-            if (!stringIsValue) {
-                const ctx = currentContext();
-                ctx.pendingKey = currentString;
-            } else if (activeValueKey) {
-                setValue(activeValueKey, currentString, activeValueIsText);
-            }
-            currentString = '';
-            stringIsValue = false;
-            activeValueKey = null;
-            activeValueIsText = false;
-        };
-
-        const decodeEscape = (ch) => {
-            switch (ch) {
-                case '"': return '"';
-                case '\\': return '\\';
-                case '/': return '/';
-                case 'b': return '\b';
-                case 'f': return '\f';
-                case 'n': return '\n';
-                case 'r': return '\r';
-                case 't': return '\t';
-                default: return ch;
-            }
-        };
-
-        const feed = (chunk) => {
-            buffer += String(chunk || '');
-            for (; index < buffer.length; index += 1) {
-                const ch = buffer[index];
-                if (inString) {
-                    if (escape) {
-                        if (unicode !== null) {
-                            if (/^[0-9a-fA-F]$/.test(ch)) {
-                                unicode += ch;
-                                if (unicode.length === 4) {
-                                    const code = parseInt(unicode, 16);
-                                    if (Number.isFinite(code)) {
-                                        appendChar(String.fromCharCode(code));
-                                    }
-                                    unicode = null;
-                                    escape = false;
-                                }
-                            } else {
-                                unicode = null;
-                                escape = false;
-                                appendChar(ch);
-                            }
-                        } else if (ch === 'u') {
-                            unicode = '';
-                        } else {
-                            appendChar(decodeEscape(ch));
-                            escape = false;
-                        }
-                        continue;
-                    }
-                    if (ch === '\\') {
-                        escape = true;
-                        continue;
-                    }
-                    if (ch === '"') {
-                        inString = false;
-                        finishString();
-                        continue;
-                    }
-                    appendChar(ch);
-                    continue;
-                }
-
-                if (ch === '"') {
-                    const ctx = currentContext();
-                    inString = true;
-                    stringIsValue = !!ctx.expectingValue;
-                    if (stringIsValue) {
-                        activeValueKey = ctx.pendingKey;
-                        activeValueIsText = !!ctx.isText;
-                        ctx.pendingKey = null;
-                        ctx.expectingValue = false;
-                    }
-                    continue;
-                }
-
-                if (ch === ':') {
-                    const ctx = currentContext();
-                    ctx.expectingValue = true;
-                    continue;
-                }
-
-                if (ch === '{') {
-                    const parent = currentContext();
-                    const newKey = parent.pendingKey;
-                    const isText = (newKey === 'text') || parent.isText;
-                    contexts.push({ key: newKey, isText, pendingKey: null, expectingValue: false });
-                    parent.pendingKey = null;
-                    parent.expectingValue = false;
-                    continue;
-                }
-
-                if (ch === '}') {
-                    contexts.pop();
-                    if (!contexts.length) {
-                        contexts.push({ key: null, isText: false, pendingKey: null, expectingValue: false });
-                    }
-                    continue;
-                }
-
-                if (ch === ',') {
-                    const ctx = currentContext();
-                    ctx.pendingKey = null;
-                    ctx.expectingValue = false;
-                    continue;
-                }
-            }
-
-            if (index > 2048) {
-                buffer = buffer.slice(index);
-                index = 0;
-            }
-        };
-
-        const getValue = (key) => {
-            const k = String(key);
-            if (textPartials.has(k)) return textPartials.get(k);
-            if (textValues.has(k)) return textValues.get(k);
-            if (rootPartials.has(k)) return rootPartials.get(k);
-            if (rootValues.has(k)) return rootValues.get(k);
-            return '';
-        };
-
-        return { feed, getValue };
-    }
-
-    // Remove control-code style XML-ish blocks some local LLMs emit
+    // Strip non-translation wrapper content some local LLMs emit.
     function sanitizeLocalOutput(s) {
         if (typeof s !== 'string') return '';
         let out = s;
@@ -604,6 +432,8 @@
         out = out.replace(/<\s*think\b[\s\S]*?>[\s\S]*?<\s*\/\s*think\s*>/gi, '');
         // Also remove any self-closing <think .../> just in case
         out = out.replace(/<\s*think\b[\s\S]*?\/>/gi, '');
+        // Some models still wrap plain-text output in a fenced block.
+        out = out.replace(/^```(?:[\w-]+)?\s*([\s\S]*?)\s*```$/u, '$1');
         // Trim leftover whitespace
         out = out.trim();
         return out;

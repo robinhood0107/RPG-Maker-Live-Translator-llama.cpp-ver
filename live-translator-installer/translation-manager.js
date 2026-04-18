@@ -263,6 +263,52 @@
             return !hasJapaneseOrChinese;
         }
 
+        function isAbortErrorLike(error) {
+            if (!error) return false;
+            if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
+            const message = typeof error.message === 'string' ? error.message : String(error);
+            return /\bAbortError\b/i.test(message) || /\baborted\b/i.test(message);
+        }
+
+        function finalizeTranslationSuccess(normalized, translated) {
+            try { cache.ongoing.delete(normalized); } catch (_) {}
+            const limit = getCacheEntryLimit();
+            if (limit > 0) pruneMapToLimit(cache.completed, limit);
+            cache.completed.set(normalized, translated);
+            telemetrySafe.logTranslation('completed', normalized, translated);
+            if (disk.enabled && typeof disk.appendRecord === 'function') {
+                try { disk.appendRecord(normalized, translated); } catch (_) {}
+            }
+        }
+
+        function finalizeTranslationFailure(normalized, error) {
+            const message = error && error.message ? error.message : 'unknown error';
+            telemetrySafe.logTranslation(isAbortErrorLike(error) ? 'aborted' : 'error', normalized, message);
+            try { cache.ongoing.delete(normalized); } catch (_) {}
+        }
+
+        function trackTranslationPromise(normalized, translationPromise) {
+            cache.ongoing.set(normalized, translationPromise);
+            translationPromise.then(
+                (translated) => {
+                    try {
+                        finalizeTranslationSuccess(normalized, translated);
+                    } catch (error) {
+                        logError('[Translation Cache Finalize Error]', error);
+                    }
+                    return translated;
+                },
+                (error) => {
+                    try {
+                        finalizeTranslationFailure(normalized, error);
+                    } catch (handlerError) {
+                        logError('[Translation Cache Rejection Handler Error]', handlerError);
+                    }
+                }
+            );
+            return translationPromise;
+        }
+
         function requestTranslation(text) {
             const normalized = String(text || '').trim();
             telemetrySafe.logTranslation('request', normalized);
@@ -279,28 +325,7 @@
 
             telemetrySafe.logTranslation('cache_miss', normalized);
             const translationPromise = cache.performTranslation(normalized);
-            cache.ongoing.set(normalized, translationPromise);
-
-            translationPromise
-                .then((translated) => {
-                    try { cache.ongoing.delete(normalized); } catch (_) {}
-                    const limit = getCacheEntryLimit();
-                    if (limit > 0) pruneMapToLimit(cache.completed, limit);
-                    cache.completed.set(normalized, translated);
-                    telemetrySafe.logTranslation('completed', normalized, translated);
-                    if (disk.enabled && typeof disk.appendRecord === 'function') {
-                        try { disk.appendRecord(normalized, translated); } catch (_) {}
-                    }
-                    return translated;
-                })
-                .catch((error) => {
-                    const message = error && error.message ? error.message : 'unknown error';
-                    telemetrySafe.logTranslation('error', normalized, message);
-                    cache.ongoing.delete(normalized);
-                    throw error;
-                });
-
-            return translationPromise;
+            return trackTranslationPromise(normalized, translationPromise);
         }
 
         function requestTranslationStream(text, options = {}) {
@@ -319,28 +344,7 @@
 
             telemetrySafe.logTranslation('cache_miss', normalized);
             const translationPromise = cache.performTranslationStream(normalized, options);
-            cache.ongoing.set(normalized, translationPromise);
-
-            translationPromise
-                .then((translated) => {
-                    try { cache.ongoing.delete(normalized); } catch (_) {}
-                    const limit = getCacheEntryLimit();
-                    if (limit > 0) pruneMapToLimit(cache.completed, limit);
-                    cache.completed.set(normalized, translated);
-                    telemetrySafe.logTranslation('completed', normalized, translated);
-                    if (disk.enabled && typeof disk.appendRecord === 'function') {
-                        try { disk.appendRecord(normalized, translated); } catch (_) {}
-                    }
-                    return translated;
-                })
-                .catch((error) => {
-                    const message = error && error.message ? error.message : 'unknown error';
-                    telemetrySafe.logTranslation('error', normalized, message);
-                    cache.ongoing.delete(normalized);
-                    throw error;
-                });
-
-            return translationPromise;
+            return trackTranslationPromise(normalized, translationPromise);
         }
 
         async function performTranslation(text) {
