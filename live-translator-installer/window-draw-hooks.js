@@ -50,6 +50,11 @@
 
         const redrawSettings = { extraPadding: 0, defaultOutline: 0 };
 
+        function sanitizeDrawTextOutput(text, type) {
+            if (typeof text !== 'string') return text;
+            return type === 'drawText' ? stripRpgmEscapes(text) : text;
+        }
+
         function addBitmapSuppressionRect(bitmap, x1, y1, x2, y2, durationMs = 200, content = null) {
             try {
                 if (!bitmap) return;
@@ -256,6 +261,7 @@
                     if (placeholderInfo) {
                         trans = restoreControlCodes(trans, placeholderInfo, textToTranslate);
                     }
+                    trans = sanitizeDrawTextOutput(trans, type);
                     textEntry.translatedText = trans;
                     textEntry.translationStatus = 'completed';
                     return;
@@ -275,9 +281,10 @@
             textEntry.translationPromise
                 .then((translatedText) => {
                     if (textEntry._trStale) return;
-                    const restored = textEntry.placeholderInfo
+                    let restored = textEntry.placeholderInfo
                         ? restoreControlCodes(translatedText, textEntry.placeholderInfo, textEntry.placeholderInfo.original)
                         : translatedText;
+                    restored = sanitizeDrawTextOutput(restored, textEntry.type);
                     textEntry.translatedText = restored;
                     textEntry.translationStatus = 'completed';
                     textEntry.translationTimestamp = Date.now();
@@ -358,7 +365,10 @@
 
                 const { x, y } = textEntry.position;
                 const originalText = textEntry.convertedText;
-                const translatedText = textEntry.translatedText || textEntry.convertedText;
+                const translatedText = sanitizeDrawTextOutput(
+                    textEntry.translatedText || textEntry.convertedText,
+                    textEntry.type
+                );
 
                 if (originalText === translatedText) {
                     telemetry.logDraw('skip_same', originalText, x, y, { windowType: targetWindow.constructor.name });
@@ -593,6 +603,7 @@
                         translated = inlinePlaceholderInfo
                             ? restoreControlCodes(translated, inlinePlaceholderInfo, trimmed)
                             : translated;
+                        translated = sanitizeDrawTextOutput(translated, 'drawText');
                         const key = generateKey('drawText', x, y, windowData.windowType, trimmed);
                         const rr = windowData.recentlyRedrawn && windowData.recentlyRedrawn.get ? windowData.recentlyRedrawn.get(key) : null;
                         if (rr && Date.now() - rr < 200) {
@@ -611,8 +622,9 @@
                 const entryKey = generateKey('drawText', x, y, windowData.windowType, trimmed);
                 const entry = windowData.texts.get(entryKey);
                 if (entry && entry.translationStatus === 'completed' && entry.translatedText) {
-                    const signed = REDRAW_SIGNATURE + entry.translatedText;
-                    telemetry.logDraw('redraw', entry.translatedText, x, y, { windowType: this.constructor.name, method: 'drawText-entry' });
+                    const safeTranslated = sanitizeDrawTextOutput(entry.translatedText, 'drawText');
+                    const signed = REDRAW_SIGNATURE + safeTranslated;
+                    telemetry.logDraw('redraw', safeTranslated, x, y, { windowType: this.constructor.name, method: 'drawText-entry' });
                     return invokeOriginal(signed);
                 }
 

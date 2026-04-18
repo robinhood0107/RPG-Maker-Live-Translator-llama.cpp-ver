@@ -102,81 +102,12 @@
         return { x: startX, y: startY };
     }
 
-    const stripPlaceholderDecorators = (token) => String(token || '').replace(/[^\w]/g, '');
-    const escapeRegExp = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const countOccurrences = (text, needle) => {
-        if (!needle) return 0;
-        const re = new RegExp(escapeRegExp(String(needle)), 'g');
-        let m = null;
-        let count = 0;
-        while ((m = re.exec(String(text || '')))) {
-            count++;
-            if (count > 32) break; // guard runaway
-        }
-        return count;
-    };
-
     const isAbortErrorLike = (error) => {
         if (!error) return false;
         if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
         const message = typeof error.message === 'string' ? error.message : String(error);
         return /\bAbortError\b/i.test(message) || /\baborted\b/i.test(message);
     };
-
-    function normalizePlaceholdersForRestore(text, placeholders) {
-        if (!placeholders || !placeholders.length) return null;
-        let output = String(text || '');
-        let changed = false;
-        const plainTokens = placeholders.map(stripPlaceholderDecorators);
-        placeholders.forEach((placeholder, idx) => {
-            if (output.includes(placeholder)) return;
-            const plain = plainTokens[idx];
-            if (!plain) return;
-            const patterns = [
-                new RegExp(`\\b${escapeRegExp(plain)}\\b`),
-                new RegExp(escapeRegExp(plain)),
-            ];
-            const isTag0 = idx === 0 && /TAG0/i.test(plain);
-            if (isTag0) {
-                patterns.push(new RegExp(`TAG0`, 'i'));
-            }
-            for (const pattern of patterns) {
-                if (pattern.test(output)) {
-                    output = output.replace(pattern, placeholder);
-                    changed = true;
-                    break;
-                }
-            }
-        });
-        return changed ? output : null;
-    }
-
-    function validatePlaceholderPresence(text, placeholders) {
-        if (!placeholders || !placeholders.length) return { missingStandard: [], missingPlain: [] };
-        const value = String(text || '');
-        const plainTokens = placeholders.map(stripPlaceholderDecorators);
-        const missingStandard = [];
-        const missingPlain = [];
-        const countMismatches = [];
-        placeholders.forEach((token, idx) => {
-            const countStd = countOccurrences(value, token);
-            if (countStd === 0) {
-                missingStandard.push(token);
-            } else if (countStd !== 1) {
-                countMismatches.push({ token, count: countStd });
-            }
-            const plain = plainTokens[idx];
-            if (plain && !new RegExp(escapeRegExp(plain)).test(value)) {
-                missingPlain.push(plain);
-            } else if (plain) {
-                const countPlain = countOccurrences(value, plain);
-                if (countPlain !== 1) {
-                    countMismatches.push({ token: plain, count: countPlain, plain: true });
-                }
-            }
-        });
-        return { missingStandard, missingPlain, countMismatches };
-    }
 
     function createEscapeAwarePayload(rawText, context = 'message') {
         const resolved = String(rawText || '');
@@ -208,67 +139,11 @@
 
     function restoreMessageText(translated, payload) {
         if (!payload) return translated;
-        const placeholders = payload.placeholderInfo && Array.isArray(payload.placeholderInfo.placeholders)
-            ? payload.placeholderInfo.placeholders
-            : null;
-
-        let candidate = translated;
-
-        if (placeholders && placeholders.length) {
-            const { missingStandard, missingPlain, countMismatches } = validatePlaceholderPresence(candidate, placeholders);
-            const irregularities = [];
-            if (missingStandard.length) irregularities.push('missing_standard');
-            if (missingPlain.length) irregularities.push('missing_plain');
-            if (countMismatches.length) irregularities.push('count_mismatch');
-            if (irregularities.length) {
-                logEscape('debug', `Placeholder irregularity detected (${irregularities.join(',')}); attempting recovery.`, {
-                    translatedPreview: preview(String(candidate || '')),
-                    missingStandard,
-                    missingPlain,
-                    countMismatches,
-                });
-                const recovered = normalizePlaceholdersForRestore(candidate, placeholders);
-                if (recovered) {
-                    candidate = recovered;
-                    logEscape('debug', 'Recovered placeholders via plaintext TAG scan.', {
-                        recoveredPreview: preview(String(candidate || '')),
-                    });
-                } else {
-                    logEscape('debug', 'Recovery failed; proceeding with best-effort restore.', {
-                        translatedPreview: preview(String(candidate || '')),
-                    });
-                }
-            }
-            const postValidation = validatePlaceholderPresence(candidate, placeholders);
-            if (postValidation.missingStandard.length
-                || postValidation.missingPlain.length
-                || (postValidation.countMismatches && postValidation.countMismatches.length)) {
-                logEscape('debug', 'Placeholder validation failed after recovery; falling back to original text.', {
-                    missingStandard: postValidation.missingStandard,
-                    missingPlain: postValidation.missingPlain,
-                    countMismatches: postValidation.countMismatches,
-                });
-                const stripped = stripRpgmEscapes(candidate || '').trim();
-                logEscape('debug', 'Using stripped translated text as fallback.', {
-                    strippedPreview: preview(stripped),
-                });
-                return stripped || payload.resolved;
-            }
-        }
+        const candidate = translated;
 
         try {
             const restored = restoreControlCodes(candidate, payload.placeholderInfo, payload.resolved);
             if (typeof restored === 'string' && restored.length) {
-                if (/⟦(?:TAG|NL)\d+⟧/.test(restored)) {
-                    logEscape('debug', 'Restored text still contains placeholders; falling back to original text.', {
-                        restoredPreview: preview(restored),
-                    });
-                    const stripped = stripRpgmEscapes(candidate || '').trim();
-                    logEscape('debug', 'Using stripped translated text as fallback.', {
-                        strippedPreview: preview(stripped),
-                    });
-                    return stripped || payload.resolved;
-                }
                 return restored;
             }
         } catch (error) {
@@ -1058,6 +933,14 @@
                 }
             };
 
+            const sanitizeBitmapDrawText = (text, methodName) => {
+                if (typeof text !== 'string') return text;
+                if (methodName === 'drawText' || methodName === 'drawTextS' || methodName === 'drawTextM') {
+                    return stripRpgmEscapes(text);
+                }
+                return text;
+            };
+
             const drawBitmapTextValue = (bitmap, entry, text) => {
                 if (!bitmap || !entry || typeof text !== 'string' || !text) return;
                 try { applyBitmapDrawState(bitmap, entry.drawState); } catch (_) {}
@@ -1066,9 +949,10 @@
                     : 'drawText';
                 const drawFn = bitmap[drawMethodName] || bitmap.drawText;
                 if (typeof drawFn !== 'function') return;
+                const safeText = sanitizeBitmapDrawText(text, drawMethodName);
                 drawFn.call(
                     bitmap,
-                    text,
+                    safeText,
                     entry.drawParams.x,
                     entry.drawParams.y,
                     entry.drawParams.maxWidth,
@@ -1711,6 +1595,7 @@
                 } catch (restoreError) {
                     logger.warn('[bitmap/restore-error]', restoreError);
                 }
+                restored = sanitizeBitmapDrawText(restored, entry.methodName);
                 if (typeof restored !== 'string') restored = entry.rawText;
                 const restoredTrimmed = sanitizePerChar(stripRpgmEscapes(restored || '')).trim();
                 if (!restoredTrimmed || restoredTrimmed === entry.trimmedText) {

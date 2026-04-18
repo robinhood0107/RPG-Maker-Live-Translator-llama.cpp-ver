@@ -14,6 +14,7 @@
     }
 
     const CONTROL_CODE_PATTERN = '\\x1b(?:[A-Za-z{}]|[\\$!><\\^\\|\\{\\}])(?:\\[[^\\]]*\\])?';
+    const CONTROL_CODE_PLACEHOLDER = '¤';
 
     const createControlCodeRegex = () => new RegExp(CONTROL_CODE_PATTERN, 'g');
 
@@ -35,66 +36,58 @@
         return String(input).replace(createControlCodeRegex(), '');
     }
 
-    // For the local LLM path, send the original text through unchanged so the model
-    // sees the same control codes RPG Maker will ultimately render.
-    // Other providers still receive placeholder tokens so we can restore codes later.
+    // Replace every RPG Maker control code with the same rare marker and restore
+    // them strictly in encounter order after translation.
     function prepareTextForTranslation(input) {
         const original = String(input || '');
         const provider = getActiveProvider();
-        if (provider === 'local') {
-            return {
-                textForTranslation: original,
-                placeholders: [],
-                newlineData: null,
-                original,
-                preservesControlCodes: true,
+        const controlCodes = original.match(createControlCodeRegex()) || [];
+        const withoutControlCodes = controlCodes.length
+            ? original.replace(createControlCodeRegex(), CONTROL_CODE_PLACEHOLDER)
+            : original;
+
+        let textForTranslation = withoutControlCodes;
+        let newlineData = null;
+
+        if (provider !== 'local') {
+            newlineData = {
+                tokens: [],
+                values: [],
+                positions: [],
+                baseLength: 0,
             };
+
+            const newlineRegex = /\r?\n/g;
+            let newlineIdx = 0;
+            let lastIndex = 0;
+            let processedNonNewline = 0;
+
+            textForTranslation = withoutControlCodes.replace(newlineRegex, (match, offset) => {
+                const chunkLength = offset - lastIndex;
+                if (chunkLength > 0) {
+                    processedNonNewline += chunkLength;
+                }
+
+                const token = `⟦NL${newlineIdx++}⟧`;
+                newlineData.tokens.push(token);
+                newlineData.values.push(match);
+                newlineData.positions.push(processedNonNewline);
+
+                lastIndex = offset + match.length;
+                return token;
+            });
+
+            processedNonNewline += withoutControlCodes.length - lastIndex;
+            newlineData.baseLength = processedNonNewline;
         }
-
-        const placeholders = [];
-        let controlIdx = 0;
-        const withoutControlCodes = original.replace(createControlCodeRegex(), () => {
-            const token = `⟦TAG${controlIdx++}⟧`;
-            placeholders.push(token);
-            return token;
-        });
-
-        const newlineData = {
-            tokens: [],
-            values: [],
-            positions: [],
-            baseLength: 0,
-        };
-
-        const newlineRegex = /\r?\n/g;
-        let newlineIdx = 0;
-        let lastIndex = 0;
-        let processedNonNewline = 0;
-
-        const textForTranslation = withoutControlCodes.replace(newlineRegex, (match, offset) => {
-            const chunkLength = offset - lastIndex;
-            if (chunkLength > 0) {
-                processedNonNewline += chunkLength;
-            }
-
-            const token = `⟦NL${newlineIdx++}⟧`;
-            newlineData.tokens.push(token);
-            newlineData.values.push(match);
-            newlineData.positions.push(processedNonNewline);
-
-            lastIndex = offset + match.length;
-            return token;
-        });
-
-        processedNonNewline += withoutControlCodes.length - lastIndex;
-        newlineData.baseLength = processedNonNewline;
 
         return {
             textForTranslation,
-            placeholders,
+            placeholders: controlCodes.length ? new Array(controlCodes.length).fill(CONTROL_CODE_PLACEHOLDER) : [],
+            controlCodes,
+            controlCodeMarker: CONTROL_CODE_PLACEHOLDER,
             newlineData,
             original,
-            preservesControlCodes: false,
         };
     }
 
@@ -102,10 +95,6 @@
     function restoreControlCodes(translated, placeholderData, fallbackOriginal) {
         if (translated === null || translated === undefined) return translated;
         const info = placeholderData || {};
-        const placeholders = Array.isArray(info.placeholders)
-            ? info.placeholders
-            : (Array.isArray(info) ? info : []);
-
         const newlineInfo = (!Array.isArray(info) && info && typeof info === 'object')
             ? info.newlineData
             : undefined;
@@ -123,10 +112,6 @@
             : null;
 
         let output = String(translated);
-
-        if (info && info.preservesControlCodes) {
-            return clampConsecutiveNewlines(output);
-        }
 
         if (newlineTokens.length) {
             const missingInserts = [];
@@ -146,22 +131,29 @@
             }
         }
 
-        if (!placeholders.length) {
-            return clampConsecutiveNewlines(output);
-        }
-
         const source = typeof info.original === 'string'
             ? info.original
             : (typeof fallbackOriginal === 'string' ? fallbackOriginal : '');
+        const controlCodes = Array.isArray(info.controlCodes)
+            ? info.controlCodes
+            : (source ? (source.match(createControlCodeRegex()) || []) : []);
+        const marker = typeof info.controlCodeMarker === 'string' && info.controlCodeMarker
+            ? info.controlCodeMarker
+            : CONTROL_CODE_PLACEHOLDER;
+        return clampConsecutiveNewlines(restoreSequentialMarkers(output, marker, controlCodes));
+    }
 
-        const codes = source
-            ? (source.match(createControlCodeRegex()) || [])
-            : [];
-
-        placeholders.forEach((token, idx) => {
-            output = output.replace(token, codes[idx] || '');
-        });
-        return clampConsecutiveNewlines(output);
+    function restoreSequentialMarkers(text, marker, replacements) {
+        const value = String(text || '');
+        if (!marker || value.indexOf(marker) === -1) {
+            return value;
+        }
+        const parts = value.split(marker);
+        let output = parts[0] || '';
+        for (let idx = 1; idx < parts.length; idx++) {
+            output += (idx - 1 < replacements.length ? replacements[idx - 1] : '') + parts[idx];
+        }
+        return output;
     }
 
     function insertMissingNewlines(text, inserts, baseLength) {
@@ -205,5 +197,6 @@
         prepareTextForTranslation,
         restoreControlCodes,
         CONTROL_CODE_PATTERN,
+        CONTROL_CODE_PLACEHOLDER,
     };
 })();
