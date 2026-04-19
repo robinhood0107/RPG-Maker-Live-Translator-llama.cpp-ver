@@ -43,4 +43,6 @@ To translate other languages than Chinese, Japanese, or Korean, set `"disableCjk
 
 1.8 - fix bitmap redraw clearing out graphics
 
+1.10 - fix longstanding errorneous bitmap clear problems
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)
