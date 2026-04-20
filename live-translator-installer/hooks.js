@@ -103,6 +103,10 @@
         return { x: startX, y: startY };
     }
 
+    const GAME_MESSAGE_ESCAPE_CODE_PATTERN = /^[\$\.\|\^!><\{\}\\]|^[A-Z]+/i;
+    const GAME_MESSAGE_NUMERIC_PARAM_PATTERN = /^\[\d+\]/;
+    const GAME_MESSAGE_CJK_CHAR_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+
     const isAbortErrorLike = (error) => {
         if (!error) return false;
         if (error.name === 'AbortError' || error.code === 'ABORT_ERR') return true;
@@ -132,23 +136,59 @@
         if (!Number.isInteger(scalePercent) || scalePercent <= 0 || scalePercent >= 100) return null;
 
         const scaleFactor = scalePercent / 100;
-        const contents = windowInstance.contents;
-        const originalState = captureBitmapDrawState(contents);
         const wrappedMethods = [];
-        let logicalFontSize = originalState && Number.isFinite(originalState.fontSize)
-            ? originalState.fontSize
-            : null;
+        const originalStates = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+        let trackedContents = null;
+        let logicalFontSize = null;
 
-        const refreshLogicalFontSize = () => {
-            const current = contents ? Number(contents.fontSize) : NaN;
+        const rememberOriginalState = (contents) => {
+            if (!contents || !originalStates || originalStates.has(contents)) return;
+            originalStates.set(contents, captureBitmapDrawState(contents));
+        };
+
+        const syncTrackedContents = (contents) => {
+            if (!contents) {
+                trackedContents = null;
+                try { windowInstance._trGameMessageTextScaleContents = null; } catch (_) {}
+                return null;
+            }
+            if (contents !== trackedContents) {
+                trackedContents = contents;
+                rememberOriginalState(contents);
+                try { windowInstance._trGameMessageTextScaleContents = contents; } catch (_) {}
+                if (!Number.isFinite(logicalFontSize) || logicalFontSize <= 0) {
+                    const initialFontSize = Number(contents.fontSize);
+                    if (Number.isFinite(initialFontSize) && initialFontSize > 0) {
+                        logicalFontSize = initialFontSize;
+                    }
+                }
+            }
+            return contents;
+        };
+
+        const getTrackedContents = () => {
+            const current = windowInstance ? windowInstance.contents : null;
+            if (!current) {
+                return syncTrackedContents(null);
+            }
+            if (current !== trackedContents) {
+                return syncTrackedContents(current);
+            }
+            return current;
+        };
+
+        const refreshLogicalFontSize = (contents = getTrackedContents()) => {
+            const activeContents = syncTrackedContents(contents);
+            const current = activeContents ? Number(activeContents.fontSize) : NaN;
             if (Number.isFinite(current) && current > 0) {
                 logicalFontSize = current;
             }
         };
 
-        const applyScaledFontSize = () => {
-            if (!contents || !Number.isFinite(logicalFontSize) || logicalFontSize <= 0) return;
-            contents.fontSize = Math.max(1, Math.round(logicalFontSize * scaleFactor));
+        const applyScaledFontSize = (contents = getTrackedContents()) => {
+            const activeContents = syncTrackedContents(contents);
+            if (!activeContents || !Number.isFinite(logicalFontSize) || logicalFontSize <= 0) return;
+            activeContents.fontSize = Math.max(1, Math.round(logicalFontSize * scaleFactor));
         };
 
         const wrapMethod = (name, factory) => {
@@ -163,23 +203,30 @@
         };
 
         const invokeWithLogicalFontSize = (original, context, args) => {
+            const contents = syncTrackedContents((context && context.contents) ? context.contents : getTrackedContents());
             if (contents && Number.isFinite(logicalFontSize) && logicalFontSize > 0) {
                 contents.fontSize = logicalFontSize;
             }
             const result = original.apply(context, args);
-            if (context && context.contents === contents) {
-                refreshLogicalFontSize();
-            }
-            applyScaledFontSize();
+            const updatedContents = (context && context.contents) ? context.contents : getTrackedContents();
+            refreshLogicalFontSize(updatedContents);
+            applyScaledFontSize(updatedContents);
             return result;
         };
 
         wrapMethod('resetFontSettings', (original) => function(...args) {
             const result = original.apply(this, args);
-            if (this && this.contents === contents) {
-                refreshLogicalFontSize();
-            }
-            applyScaledFontSize();
+            const currentContents = (this && this.contents) ? this.contents : getTrackedContents();
+            refreshLogicalFontSize(currentContents);
+            applyScaledFontSize(currentContents);
+            return result;
+        });
+
+        wrapMethod('createContents', (original) => function(...args) {
+            const result = original.apply(this, args);
+            const currentContents = (this && this.contents) ? this.contents : getTrackedContents();
+            refreshLogicalFontSize(currentContents);
+            applyScaledFontSize(currentContents);
             return result;
         });
 
@@ -205,14 +252,448 @@
                         }
                     } catch (_) {}
                 }
-                if (windowInstance.contents === contents && originalState) {
-                    try { applyBitmapDrawState(contents, originalState); } catch (_) {}
+                const currentContents = windowInstance ? windowInstance.contents : null;
+                if (currentContents) {
+                    const originalState = originalStates && originalStates.has(currentContents)
+                        ? originalStates.get(currentContents)
+                        : captureBitmapDrawState(currentContents);
+                    if (originalState) {
+                        try { applyBitmapDrawState(currentContents, originalState); } catch (_) {}
+                    }
                 }
             }
         };
     }
 
-    function redrawGameMessageText(windowInstance, text, overrides = {}) {
+    function disposeGameMessageTextScaleScope(windowInstance) {
+        if (!windowInstance || !windowInstance._trGameMessageTextScaleScope) return;
+        try {
+            windowInstance._trGameMessageTextScaleScope.restore();
+        } catch (_) {}
+        windowInstance._trGameMessageTextScaleScope = null;
+        windowInstance._trGameMessageTextScaleContents = null;
+    }
+
+    function ensureGameMessageTextScaleScope(windowInstance) {
+        if (!windowInstance || !windowInstance.contents) return null;
+        if (!Number.isInteger(gameMessageTextScale) || gameMessageTextScale <= 0 || gameMessageTextScale >= 100) {
+            disposeGameMessageTextScaleScope(windowInstance);
+            return null;
+        }
+        if (windowInstance._trGameMessageTextScaleScope) {
+            windowInstance._trGameMessageTextScaleContents = windowInstance.contents;
+            return windowInstance._trGameMessageTextScaleScope;
+        }
+        disposeGameMessageTextScaleScope(windowInstance);
+        const scope = createGameMessageTextScaleScope(windowInstance, gameMessageTextScale);
+        if (scope) {
+            windowInstance._trGameMessageTextScaleScope = scope;
+            windowInstance._trGameMessageTextScaleContents = windowInstance.contents;
+        }
+        return scope;
+    }
+
+    function getCurrentGameMessageLineHeight(windowInstance) {
+        if (!windowInstance || !windowInstance.contents) return 32;
+        const fontSize = Number(windowInstance.contents.fontSize);
+        return Number.isFinite(fontSize) && fontSize > 0 ? fontSize + 8 : 32;
+    }
+
+    function resetGameMessageWrapPageState(windowInstance, wrapState) {
+        if (typeof windowInstance.resetFontSettings === 'function') {
+            windowInstance.resetFontSettings();
+        }
+        wrapState.currentX = wrapState.startX;
+        wrapState.currentY = 0;
+        wrapState.hasContentOnLine = false;
+        wrapState.trimLeadingWhitespace = false;
+        wrapState.lineHeight = getCurrentGameMessageLineHeight(windowInstance);
+    }
+
+    function commitGameMessageWrapLineBreak(windowInstance, wrapState, inserted) {
+        wrapState.currentX = wrapState.startX;
+        wrapState.currentY += wrapState.lineHeight;
+        wrapState.hasContentOnLine = false;
+        wrapState.trimLeadingWhitespace = !!inserted;
+        wrapState.lineHeight = getCurrentGameMessageLineHeight(windowInstance);
+        if (wrapState.contentsHeight > 0
+            && wrapState.currentY + wrapState.lineHeight > wrapState.contentsHeight) {
+            resetGameMessageWrapPageState(windowInstance, wrapState);
+        }
+    }
+
+    function readGameMessageEscapeToken(text, index) {
+        if (text.charAt(index) !== '\x1b') return null;
+        let cursor = index + 1;
+        let raw = '\x1b';
+        let code = '';
+        const codeMatch = GAME_MESSAGE_ESCAPE_CODE_PATTERN.exec(text.slice(cursor));
+        if (codeMatch && codeMatch[0]) {
+            code = String(codeMatch[0] || '');
+            cursor += code.length;
+            raw += code;
+        }
+        let param = null;
+        const paramMatch = GAME_MESSAGE_NUMERIC_PARAM_PATTERN.exec(text.slice(cursor));
+        if (paramMatch && paramMatch[0]) {
+            raw += paramMatch[0];
+            cursor += paramMatch[0].length;
+            param = parseInt(paramMatch[0].slice(1, -1), 10);
+        }
+        return {
+            type: 'escape',
+            raw,
+            code: code.toUpperCase(),
+            param,
+            nextIndex: cursor,
+        };
+    }
+
+    function isGameMessageWhitespace(character) {
+        return character === ' ' || character === '\t';
+    }
+
+    function isGameMessageCjkCharacter(character) {
+        return GAME_MESSAGE_CJK_CHAR_PATTERN.test(character);
+    }
+
+    function tokenizeGameMessageText(text) {
+        const tokens = [];
+        const source = String(text || '');
+        let index = 0;
+
+        while (index < source.length) {
+            const character = source.charAt(index);
+            if (character === '\n') {
+                tokens.push({ type: 'newline', raw: '\n' });
+                index += 1;
+                continue;
+            }
+            if (character === '\f') {
+                tokens.push({ type: 'newpage', raw: '\f' });
+                index += 1;
+                continue;
+            }
+            if (character === '\x1b') {
+                const escapeToken = readGameMessageEscapeToken(source, index);
+                if (escapeToken) {
+                    tokens.push(escapeToken);
+                    index = escapeToken.nextIndex;
+                    continue;
+                }
+            }
+            if (isGameMessageWhitespace(character)) {
+                let end = index + 1;
+                while (end < source.length && isGameMessageWhitespace(source.charAt(end))) {
+                    end += 1;
+                }
+                tokens.push({ type: 'space', raw: source.slice(index, end) });
+                index = end;
+                continue;
+            }
+            if (isGameMessageCjkCharacter(character)) {
+                tokens.push({ type: 'text', raw: character, forceCharWrap: true });
+                index += 1;
+                continue;
+            }
+            let end = index + 1;
+            while (end < source.length) {
+                const nextChar = source.charAt(end);
+                if (nextChar === '\n'
+                    || nextChar === '\f'
+                    || nextChar === '\x1b'
+                    || isGameMessageWhitespace(nextChar)
+                    || isGameMessageCjkCharacter(nextChar)) {
+                    break;
+                }
+                end += 1;
+            }
+            tokens.push({ type: 'text', raw: source.slice(index, end), forceCharWrap: false });
+            index = end;
+        }
+
+        return tokens;
+    }
+
+    function measureGameMessageTokenWidth(windowInstance, token) {
+        if (!windowInstance || !windowInstance.contents || !token) return 0;
+        if (token.type === 'escape') {
+            if (token.code === 'I') {
+                const iconWidth = typeof Window_Base !== 'undefined' && Number.isFinite(Window_Base._iconWidth)
+                    ? Window_Base._iconWidth
+                    : 32;
+                return iconWidth + 4;
+            }
+            return 0;
+        }
+        if (token.type !== 'space' && token.type !== 'text') return 0;
+        const raw = String(token.raw || '');
+        if (!raw) return 0;
+        try {
+            if (typeof windowInstance.textWidth === 'function') {
+                return Math.max(0, Math.ceil(windowInstance.textWidth(raw)));
+            }
+            if (windowInstance.contents && typeof windowInstance.contents.measureTextWidth === 'function') {
+                return Math.max(0, Math.ceil(windowInstance.contents.measureTextWidth(raw)));
+            }
+        } catch (_) {}
+        return raw.length * Math.max(1, Math.round(getCurrentGameMessageLineHeight(windowInstance) / 2));
+    }
+
+    function applyGameMessageEscapeToken(windowInstance, wrapState, token) {
+        if (!windowInstance || !token || token.type !== 'escape') return;
+        switch (token.code) {
+        case '{':
+            if (typeof windowInstance.makeFontBigger === 'function') {
+                windowInstance.makeFontBigger();
+            }
+            wrapState.lineHeight = Math.max(wrapState.lineHeight, getCurrentGameMessageLineHeight(windowInstance));
+            break;
+        case '}':
+            if (typeof windowInstance.makeFontSmaller === 'function') {
+                windowInstance.makeFontSmaller();
+            }
+            wrapState.lineHeight = Math.max(wrapState.lineHeight, getCurrentGameMessageLineHeight(windowInstance));
+            break;
+        case 'I':
+            wrapState.currentX += measureGameMessageTokenWidth(windowInstance, token);
+            wrapState.hasContentOnLine = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    function appendMeasuredGameMessageText(windowInstance, wrapState, output, raw) {
+        const token = { type: 'text', raw };
+        wrapState.lineHeight = Math.max(wrapState.lineHeight, getCurrentGameMessageLineHeight(windowInstance));
+        wrapState.currentX += measureGameMessageTokenWidth(windowInstance, token);
+        wrapState.hasContentOnLine = true;
+        wrapState.trimLeadingWhitespace = false;
+        output.push(raw);
+    }
+
+    function appendGameMessageTextRun(windowInstance, wrapState, output, raw) {
+        const text = String(raw || '');
+        if (!text) return;
+        const tokenWidth = measureGameMessageTokenWidth(windowInstance, { type: 'text', raw: text });
+        if (wrapState.currentX + tokenWidth <= wrapState.contentsWidth) {
+            appendMeasuredGameMessageText(windowInstance, wrapState, output, text);
+            return;
+        }
+
+        if (wrapState.hasContentOnLine) {
+            output.push('\n');
+            commitGameMessageWrapLineBreak(windowInstance, wrapState, true);
+        }
+
+        const fullWidth = measureGameMessageTokenWidth(windowInstance, { type: 'text', raw: text });
+        if (fullWidth <= wrapState.contentsWidth || text.length <= 1) {
+            appendMeasuredGameMessageText(windowInstance, wrapState, output, text);
+            return;
+        }
+
+        for (const character of Array.from(text)) {
+            const charWidth = measureGameMessageTokenWidth(windowInstance, { type: 'text', raw: character });
+            if (wrapState.hasContentOnLine && wrapState.currentX + charWidth > wrapState.contentsWidth) {
+                output.push('\n');
+                commitGameMessageWrapLineBreak(windowInstance, wrapState, true);
+            }
+            appendMeasuredGameMessageText(windowInstance, wrapState, output, character);
+        }
+    }
+
+    function wrapGameMessageText(windowInstance, text) {
+        if (!windowInstance || !windowInstance.contents) return String(text || '');
+        const source = String(text || '');
+        if (!source) return source;
+
+        ensureGameMessageTextScaleScope(windowInstance);
+        if (typeof windowInstance.resetFontSettings === 'function') {
+            windowInstance.resetFontSettings();
+        }
+
+        const startX = (() => {
+            try {
+                if (typeof windowInstance.newLineX === 'function') {
+                    const value = Number(windowInstance.newLineX());
+                    if (Number.isFinite(value)) return Math.max(0, value);
+                }
+            } catch (_) {}
+            const fallback = resolveMessageStartCoordinates(windowInstance);
+            return Number.isFinite(fallback.x) ? Math.max(0, fallback.x) : 0;
+        })();
+        const contentsWidth = windowInstance.contents && Number.isFinite(windowInstance.contents.width)
+            ? Math.max(startX + 1, Number(windowInstance.contents.width))
+            : Number.MAX_SAFE_INTEGER;
+        const contentsHeight = windowInstance.contents && Number.isFinite(windowInstance.contents.height)
+            ? Math.max(1, Number(windowInstance.contents.height))
+            : Number.MAX_SAFE_INTEGER;
+
+        const wrapState = {
+            startX,
+            currentX: startX,
+            currentY: 0,
+            contentsWidth,
+            contentsHeight,
+            lineHeight: getCurrentGameMessageLineHeight(windowInstance),
+            hasContentOnLine: false,
+            trimLeadingWhitespace: false,
+        };
+        const output = [];
+        const tokens = tokenizeGameMessageText(source);
+
+        for (const token of tokens) {
+            if (!token) continue;
+
+            if (token.type === 'newline') {
+                output.push(token.raw);
+                commitGameMessageWrapLineBreak(windowInstance, wrapState, false);
+                continue;
+            }
+
+            if (token.type === 'newpage') {
+                output.push(token.raw);
+                resetGameMessageWrapPageState(windowInstance, wrapState);
+                continue;
+            }
+
+            if (token.type === 'escape') {
+                if (token.code === 'I') {
+                    const iconWidth = measureGameMessageTokenWidth(windowInstance, token);
+                    if (wrapState.hasContentOnLine && wrapState.currentX + iconWidth > wrapState.contentsWidth) {
+                        output.push('\n');
+                        commitGameMessageWrapLineBreak(windowInstance, wrapState, true);
+                    }
+                }
+                output.push(token.raw);
+                applyGameMessageEscapeToken(windowInstance, wrapState, token);
+                continue;
+            }
+
+            if (token.type === 'space') {
+                if (wrapState.trimLeadingWhitespace) {
+                    continue;
+                }
+                const spaceWidth = measureGameMessageTokenWidth(windowInstance, token);
+                if (wrapState.hasContentOnLine && wrapState.currentX + spaceWidth > wrapState.contentsWidth) {
+                    output.push('\n');
+                    commitGameMessageWrapLineBreak(windowInstance, wrapState, true);
+                    continue;
+                }
+                wrapState.currentX += spaceWidth;
+                wrapState.hasContentOnLine = wrapState.hasContentOnLine || token.raw.length > 0;
+                output.push(token.raw);
+                continue;
+            }
+
+            appendGameMessageTextRun(windowInstance, wrapState, output, token.raw);
+        }
+
+        if (typeof windowInstance.resetFontSettings === 'function') {
+            windowInstance.resetFontSettings();
+        }
+        return output.join('');
+    }
+
+    function canUseNativeGameMessageRender(windowInstance) {
+        if (!windowInstance || !windowInstance.contents) return false;
+        if (typeof windowInstance.newPage !== 'function'
+            || typeof windowInstance.processCharacter !== 'function'
+            || typeof windowInstance.isEndOfText !== 'function'
+            || typeof windowInstance.onEndOfText !== 'function') {
+            return false;
+        }
+        if (typeof windowInstance.isAnySubWindowActive === 'function' && windowInstance.isAnySubWindowActive()) {
+            return false;
+        }
+        return true;
+    }
+
+    function drawMessageFaceIfReady(windowInstance) {
+        if (!windowInstance || !windowInstance._faceBitmap) return false;
+        try {
+            if (typeof windowInstance._faceBitmap.isReady === 'function' && windowInstance._faceBitmap.isReady()) {
+                drawMessageFaceIfNeeded(windowInstance);
+                windowInstance._faceBitmap = null;
+                return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function createNativeGameMessageTextState(windowInstance, text, overrides = {}) {
+        const wrappedText = wrapGameMessageText(windowInstance, text);
+        const coords = resolveMessageStartCoordinates(windowInstance, overrides);
+
+        // MZ message windows rely on a richer text-state shape with buffered text
+        // output; MV-style minimal states leave redraws blank after contents clear.
+        if (typeof windowInstance.createTextState === 'function') {
+            const textState = windowInstance.createTextState(wrappedText, 0, coords.y, 0);
+            const startX = Number.isFinite(coords.x)
+                ? coords.x
+                : (typeof windowInstance.newLineX === 'function' ? windowInstance.newLineX(textState) : 0);
+            textState.x = startX;
+            textState.startX = startX;
+            if (Number.isFinite(coords.y)) {
+                textState.y = coords.y;
+                if (typeof textState.startY === 'number') {
+                    textState.startY = coords.y;
+                }
+            }
+            return textState;
+        }
+
+        return {
+            index: 0,
+            text: wrappedText,
+        };
+    }
+
+    function flushNativeGameMessageText(windowInstance) {
+        if (!windowInstance || !windowInstance._textState) return false;
+        const textState = windowInstance._textState;
+        const originalPause = !!windowInstance.pause;
+        const originalWait = Number(windowInstance._waitCount) || 0;
+        windowInstance.pause = false;
+        windowInstance._waitCount = 0;
+        windowInstance._showFast = true;
+        const previousBypass = windowInstance._trBypassProcessCharacter || 0;
+        windowInstance._trBypassProcessCharacter = previousBypass + 1;
+        try {
+            while (windowInstance._textState && !windowInstance.isEndOfText(textState)) {
+                if (typeof windowInstance.needsNewPage === 'function' && windowInstance.needsNewPage(textState)) {
+                    windowInstance.newPage(textState);
+                    windowInstance._showFast = true;
+                    drawMessageFaceIfReady(windowInstance);
+                }
+                windowInstance.processCharacter(textState);
+                if (windowInstance.pause || windowInstance._waitCount > 0) {
+                    break;
+                }
+            }
+            // MZ buffers printable glyphs in textState.buffer and only paints them
+            // when flushTextState runs; MV never exposes this helper.
+            if (typeof windowInstance.flushTextState === 'function') {
+                windowInstance.flushTextState(textState);
+            }
+            const isWaiting = typeof windowInstance.isWaiting === 'function'
+                ? windowInstance.isWaiting()
+                : (windowInstance.pause || windowInstance._waitCount > 0);
+            if (windowInstance._textState && windowInstance.isEndOfText(textState) && !isWaiting) {
+                windowInstance.onEndOfText();
+            }
+        } catch (error) {
+            windowInstance.pause = originalPause;
+            windowInstance._waitCount = originalWait;
+            throw error;
+        } finally {
+            windowInstance._trBypassProcessCharacter = Math.max(0, (windowInstance._trBypassProcessCharacter || 1) - 1);
+        }
+        return true;
+    }
+
+    function redrawGameMessageTextFallback(windowInstance, text, overrides = {}) {
         if (!windowInstance || !windowInstance.contents) return false;
 
         try { windowInstance.contents.clear(); } catch (_) {}
@@ -237,6 +718,44 @@
             windowInstance._trBypassProcessCharacter = Math.max(0, (windowInstance._trBypassProcessCharacter || 1) - 1);
         }
         return true;
+    }
+
+    function redrawGameMessageText(windowInstance, text, overrides = {}) {
+        if (!windowInstance || !windowInstance.contents) return false;
+        if (!canUseNativeGameMessageRender(windowInstance)) {
+            disposeGameMessageTextScaleScope(windowInstance);
+            return redrawGameMessageTextFallback(windowInstance, text, overrides);
+        }
+
+        try {
+            ensureGameMessageTextScaleScope(windowInstance);
+            const textState = createNativeGameMessageTextState(windowInstance, text, overrides);
+            windowInstance._textState = textState;
+            windowInstance.newPage(textState);
+            if (typeof windowInstance.updatePlacement === 'function') {
+                windowInstance.updatePlacement();
+            }
+            if (typeof windowInstance.updateBackground === 'function') {
+                windowInstance.updateBackground();
+            }
+            if (typeof windowInstance.open === 'function') {
+                windowInstance.open();
+            }
+            drawMessageFaceIfReady(windowInstance);
+            windowInstance._trMsgStartX = typeof textState.startX === 'number'
+                ? textState.startX
+                : (typeof textState.left === 'number' ? textState.left : resolveMessageStartCoordinates(windowInstance, overrides).x);
+            windowInstance._trMsgStartY = typeof textState.startY === 'number'
+                ? textState.startY
+                : (typeof textState.y === 'number' ? textState.y : 0);
+            windowInstance._trWrappedMessageText = String(textState.text || text || '');
+
+            return flushNativeGameMessageText(windowInstance);
+        } catch (error) {
+            disposeGameMessageTextScaleScope(windowInstance);
+            logger.warn('[GameMessage] Native render failed; falling back to drawTextEx redraw.', error);
+            return redrawGameMessageTextFallback(windowInstance, text, overrides);
+        }
     }
 
     function createEscapeAwarePayload(rawText, context = 'message') {
@@ -353,6 +872,7 @@
         // Prefer hooking startMessage to get full resolved text once
         const originalStartMessage = Window_Message.prototype.startMessage.__trOriginal || Window_Message.prototype.startMessage;
         const wrappedStartMessage = function() {
+            disposeGameMessageTextScaleScope(this);
             const res = originalStartMessage.call(this);
             try {
                 gameMessageState.session++;
@@ -369,7 +889,11 @@
                 } catch (_) {}
                 this._trStreamAbort = null;
                 this._trStreamText = '';
+                this._trStreamSessionId = null;
+                this._trStreamLoopActive = false;
+                this._trStreamDeferredLogged = false;
                 this._trPendingRedraw = null;
+                this._trWrappedMessageText = null;
 
                 try {
                     if (this && this._textState) {
@@ -470,6 +994,25 @@
             } catch (_) {}
             this._trStreamAbort = null;
             this._trStreamText = '';
+            this._trStreamSessionId = sessionId;
+            this._trStreamLoopActive = false;
+            this._trStreamDeferredLogged = false;
+
+            const stopStreamLoop = (preserveText = true) => {
+                if (this._trStreamSessionId !== sessionId) return;
+                this._trStreamLoopActive = false;
+                this._trStreamSessionId = null;
+                this._trStreamDeferredLogged = false;
+                if (!preserveText) {
+                    this._trStreamText = '';
+                }
+            };
+
+            const restoreOriginalAfterStreamPreview = () => {
+                if (this._trSessionId !== sessionId || !gameMessageState.isActive) return;
+                if (typeof this._trStreamText !== 'string' || !this._trStreamText) return;
+                redrawMessageText(this, payload.resolved, sessionId);
+            };
 
             const applyStreamDelta = (partial) => {
                 if (this._trSessionId !== sessionId || !gameMessageState.isActive) return;
@@ -479,7 +1022,11 @@
                 const restoredVisible = stripRpgmEscapes(restored || '').trim();
                 if (!restoredVisible) return;
                 this._trStreamText = restored;
-                redrawMessageText(this, restored, sessionId);
+                this._trStreamLoopActive = true;
+                if (!this._trStreamDeferredLogged) {
+                    diag('[GameMessage] Starting streamed redraw loop.');
+                    this._trStreamDeferredLogged = true;
+                }
             };
 
             const requestStream = translationCache
@@ -502,6 +1049,7 @@
                 .then(translated => {
                     // Check if session is still valid
                     if (this._trSessionId !== sessionId || !gameMessageState.isActive) {
+                        stopStreamLoop(true);
                         diag(`[GameMessage] Session expired for: "${preview(payload.visible)}"`);
                         return;
                     }
@@ -513,20 +1061,27 @@
 
                     const restoredVisible = stripRpgmEscapes(restored || '').trim();
                     if (!restoredVisible) {
+                        stopStreamLoop(true);
+                        restoreOriginalAfterStreamPreview();
                         dbg('[GameMessage Skip] Restored text empty after stripping; keeping original.');
                         return;
                     }
 
                     if (restoredVisible === payload.visible) {
+                        stopStreamLoop(true);
+                        restoreOriginalAfterStreamPreview();
                         dbg(`[GameMessage Skip] Original and translated text are identical: "${preview(payload.visible)}"`);
                         return;
                     }
 
+                    stopStreamLoop(true);
                     dbg(`[GameMessage] Translation: "${preview(payload.visible)}" -> "${preview(restoredVisible)}"`);
                     redrawMessageText(this, restored, sessionId);
                 })
                 .catch(err => {
+                    stopStreamLoop(true);
                     if (isAbortErrorLike(err)) return;
+                    restoreOriginalAfterStreamPreview();
                     logger.error('[GameMessage Translation Error]', err);
                 });
         };
@@ -555,6 +1110,7 @@
             try {
                 const wm = SceneManager && SceneManager._scene && SceneManager._scene._messageWindow;
                 if (wm) {
+                    disposeGameMessageTextScaleScope(wm);
                     wm._trStartedThisSession = false;
                     wm._trSentTranslateThisSession = false;
                     wm._trMsgStartSession = null;
@@ -568,7 +1124,11 @@
                     } catch (_) {}
                     wm._trStreamAbort = null;
                     wm._trStreamText = '';
+                    wm._trStreamSessionId = null;
+                    wm._trStreamLoopActive = false;
+                    wm._trStreamDeferredLogged = false;
                     wm._trPendingRedraw = null;
+                    wm._trWrappedMessageText = null;
                 }
             } catch (_) {}
             

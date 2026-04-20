@@ -225,7 +225,15 @@
             : streamResult && streamResult.accumulatedMessage
                 ? streamResult.accumulatedMessage
                 : '';
-        return parseLocalTextOutput(messageContent);
+        const parsedOutput = parseLocalTextOutput(messageContent);
+        if (!parsedOutput) {
+            const err = new Error('Local LLM stream returned no usable text.');
+            try { err.code = 'EMPTY_STREAM_OUTPUT'; } catch (_) {}
+            try { err.streamHadDelta = !!(streamResult && streamResult.accumulatedMessage); } catch (_) {}
+            try { err.streamHadFinal = !!(streamResult && streamResult.finalMessage); } catch (_) {}
+            throw err;
+        }
+        return parsedOutput;
     }
 
     function buildLocalChatBody(sourceText, cfg, stream) {

@@ -472,6 +472,16 @@
             Window_Message.prototype.update = function() {
                 const r = _origMsgUpdate.call(this);
                 try {
+                    if (this._trStreamLoopActive
+                        && this._trStreamSessionId
+                        && this._trStreamSessionId === this._trSessionId
+                        && typeof this._trStreamText === 'string'
+                        && this._trStreamText
+                        && this.visible
+                        && this.isOpen()
+                        && this.contents) {
+                        redrawGameMessageText(this, this._trStreamText, { streaming: true });
+                    }
                     const pending = this._trPendingRedraw;
                     if (pending && this.visible && this.isOpen() && this.contents) {
                         if (this._trSessionId === pending.sessionId) {

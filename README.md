@@ -47,4 +47,6 @@ To translate other languages than Chinese, Japanese, or Korean, set `"disableCjk
 
 1.11 - fix non-CJK games (English) and add an option to resize game_message
 
+1.12 - Game_Message rewrite. Should handle multiline texts correctly and just be more robust in general.
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)

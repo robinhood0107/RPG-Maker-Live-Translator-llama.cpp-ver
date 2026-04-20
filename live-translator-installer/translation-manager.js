@@ -365,10 +365,15 @@
                 const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
                 diag(`[Translate] #${id} Request | in="${preview(normalized)}"`);
                 const result = await translatorBatcher.request(normalized);
+                if (typeof result !== 'string' || !result.trim()) {
+                    const emptyError = new Error('Translator returned no usable text.');
+                    try { emptyError.code = 'EMPTY_TRANSLATION_OUTPUT'; } catch (_) {}
+                    throw emptyError;
+                }
                 const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
                 const timing = Math.round(end - start);
                 diag(`[Translate] #${id} OK ${timing}ms | out="${preview(result)}"`);
-                return result || normalized;
+                return result;
             } catch (err) {
                 logError('[Translation Failure]', err);
                 diag('[Translate] Failed');
@@ -384,14 +389,45 @@
             }
 
             if (isLocalProvider && typeof translateTextStream === 'function') {
+                const retryNonStreamTranslation = async (reason) => {
+                    if (reason) {
+                        logger.warn(`[Translate] ${reason} "${preview(normalized)}". Retrying with non-stream request.`);
+                    }
+                    try {
+                        const fallbackResult = await performTranslation(normalized);
+                        if (String(fallbackResult || '').trim() === normalized.trim()) {
+                            logger.warn(`[Translate] Non-stream fallback also matched input for "${preview(normalized)}".`);
+                        }
+                        return fallbackResult;
+                    } catch (fallbackErr) {
+                        const fallbackMessage = fallbackErr && fallbackErr.message
+                            ? fallbackErr.message
+                            : String(fallbackErr);
+                        logger.error(`[Translate] Non-stream fallback failed for "${preview(normalized)}": ${fallbackMessage}`);
+                        throw fallbackErr;
+                    }
+                };
                 const id = (++translateSeq) & 0x7FFFFFFF;
                 const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
                 diag(`[Translate] #${id} Stream | in="${preview(normalized)}"`);
-                const result = await translateTextStream(normalized, options);
+                let result = '';
+                try {
+                    result = await translateTextStream(normalized, options);
+                } catch (err) {
+                    if (isAbortErrorLike(err)) throw err;
+                    const message = err && err.message ? err.message : String(err);
+                    return retryNonStreamTranslation(`Stream request failed (${message}) for`);
+                }
                 const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
                 const timing = Math.round(end - start);
                 diag(`[Translate] #${id} OK ${timing}ms | out="${preview(result)}"`);
-                return result || normalized;
+                if (typeof result !== 'string' || !result.trim()) {
+                    return retryNonStreamTranslation('Stream returned no usable text for');
+                }
+                if (result.trim() === normalized.trim()) {
+                    return retryNonStreamTranslation('Stream output matched input for');
+                }
+                return result;
             }
 
             return performTranslation(normalized);
