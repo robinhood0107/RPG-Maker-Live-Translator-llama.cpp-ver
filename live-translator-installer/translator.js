@@ -37,6 +37,13 @@
             return translateOneLocalStream(String(text), TRANSLATOR_CONFIG.settings.local, options);
         },
 
+        async validateConfiguredLocalModel() {
+            if (TRANSLATOR_CONFIG.provider !== 'local') {
+                return null;
+            }
+            return resolveLocalChatModelSelection(TRANSLATOR_CONFIG.settings.local);
+        },
+
         async translateMany(texts, targetLang = null) {
             const items = Array.isArray(texts) ? texts : [texts];
             try {
@@ -239,7 +246,6 @@
     function buildLocalChatBody(sourceText, cfg, stream) {
         const systemPrompt = typeof cfg.system_prompt === 'string' ? cfg.system_prompt : '';
         const body = {
-            model: cfg.model,
             input: String(sourceText ?? ''),
             stream: !!stream,
             store: false
@@ -257,14 +263,166 @@
         return body;
     }
 
+    function getLocalApiBaseUrl(cfg) {
+        return `http://${cfg.address}:${cfg.port}`;
+    }
+
+    async function requestLocalModelCatalog(cfg) {
+        const url = `${getLocalApiBaseUrl(cfg)}/api/v1/models`;
+        let resp;
+        try {
+            resp = await fetch(url, { method: 'GET' });
+        } catch (e) {
+            throw new Error(`Local LLM model list request failed: ${e && e.message ? e.message : e}`);
+        }
+        if (!resp || !resp.ok) {
+            const status = resp ? `${resp.status} ${resp.statusText}` : 'no response';
+            throw new Error(`Local LLM model list error: ${status}`);
+        }
+        const data = await resp.json();
+        if (!data || !Array.isArray(data.models)) {
+            throw new Error('Local LLM models response missing required "models" array.');
+        }
+        return data.models;
+    }
+
+    function getLoadedLlmInstances(models) {
+        const out = [];
+        const list = Array.isArray(models) ? models : [];
+        for (const model of list) {
+            if (!model || model.type !== 'llm' || typeof model.key !== 'string' || !model.key.trim()) {
+                continue;
+            }
+            const loadedInstances = Array.isArray(model.loaded_instances) ? model.loaded_instances : [];
+            for (const instance of loadedInstances) {
+                const instanceId = instance && typeof instance.id === 'string' ? instance.id.trim() : '';
+                if (!instanceId) continue;
+                out.push({
+                    instanceId,
+                    modelKey: model.key.trim()
+                });
+            }
+        }
+        return out;
+    }
+
+    function describeLoadedLlmInstances(instances) {
+        const list = Array.isArray(instances) ? instances : [];
+        if (!list.length) return 'none';
+        return list.map((item) => {
+            if (!item || typeof item.instanceId !== 'string' || typeof item.modelKey !== 'string') {
+                return '<invalid>';
+            }
+            return item.instanceId === item.modelKey
+                ? item.instanceId
+                : `${item.instanceId} (${item.modelKey})`;
+        }).join(', ');
+    }
+
+    function getLoadedInstancesForModel(model) {
+        const modelKey = model && typeof model.key === 'string' ? model.key.trim() : '';
+        const loadedInstances = model && Array.isArray(model.loaded_instances) ? model.loaded_instances : [];
+        return loadedInstances
+            .map((instance) => ({
+                instanceId: instance && typeof instance.id === 'string' ? instance.id.trim() : '',
+                modelKey
+            }))
+            .filter((instance) => instance.instanceId);
+    }
+
+    async function resolveLocalChatModelSelection(cfg) {
+        const configuredModel = typeof cfg.model === 'string' ? cfg.model.trim() : '';
+        const models = await requestLocalModelCatalog(cfg);
+        const loadedLlmInstances = getLoadedLlmInstances(models);
+
+        if (configuredModel.toLowerCase() === 'auto') {
+            if (loadedLlmInstances.length !== 1) {
+                throw new Error(
+                    `settings.local.model is "auto", but LM Studio currently has ${loadedLlmInstances.length} loaded LLM instance(s): `
+                    + `${describeLoadedLlmInstances(loadedLlmInstances)}. Load exactly one LLM instance or set settings.local.model to a specific loaded instance identifier.`
+                );
+            }
+            return {
+                configuredModel,
+                requestedModel: loadedLlmInstances[0].instanceId,
+                expectedInstanceId: loadedLlmInstances[0].instanceId
+            };
+        }
+
+        const exactModel = models.find((model) => model && typeof model.key === 'string' && model.key.trim() === configuredModel);
+        if (exactModel) {
+            if (exactModel.type !== 'llm') {
+                throw new Error(`Configured local model "${configuredModel}" is not an LLM.`);
+            }
+
+            const loadedInstances = getLoadedInstancesForModel(exactModel);
+            if (loadedInstances.length === 0) {
+                throw new Error(`Configured local model "${configuredModel}" is not loaded in LM Studio.`);
+            }
+            if (loadedInstances.length > 1) {
+                throw new Error(
+                    `Configured local model "${configuredModel}" has ${loadedInstances.length} loaded instances: `
+                    + `${describeLoadedLlmInstances(loadedInstances)}. Set settings.local.model to a specific loaded instance identifier.`
+                );
+            }
+
+            return {
+                configuredModel,
+                requestedModel: loadedInstances[0].instanceId,
+                expectedInstanceId: loadedInstances[0].instanceId
+            };
+        }
+
+        const exactLoadedInstance = loadedLlmInstances.find((instance) => instance.instanceId === configuredModel);
+        if (exactLoadedInstance) {
+            return {
+                configuredModel,
+                requestedModel: exactLoadedInstance.instanceId,
+                expectedInstanceId: exactLoadedInstance.instanceId
+            };
+        }
+
+        throw new Error(`Configured local model "${configuredModel}" was not found in LM Studio /api/v1/models.`);
+    }
+
+    function getLocalChatResponseModelInstanceId(data) {
+        const id = data && typeof data.model_instance_id === 'string' ? data.model_instance_id.trim() : '';
+        if (!id) {
+            throw new Error('Local LLM response missing required "model_instance_id".');
+        }
+        return id;
+    }
+
+    function getLocalChatResponseStats(data) {
+        return data && data.stats && typeof data.stats === 'object' ? data.stats : null;
+    }
+
+    function assertLocalChatResponseMatchesSelection(data, selection) {
+        const responseInstanceId = getLocalChatResponseModelInstanceId(data);
+        if (responseInstanceId !== selection.expectedInstanceId) {
+            throw new Error(
+                `Local LLM responded with instance "${responseInstanceId}", but "${selection.expectedInstanceId}" was required.`
+            );
+        }
+
+        const stats = getLocalChatResponseStats(data);
+        if (stats && typeof stats.model_load_time_seconds !== 'undefined') {
+            throw new Error(
+                `Local LLM auto-loaded "${responseInstanceId}" unexpectedly. The configured model must already be loaded in LM Studio.`
+            );
+        }
+    }
+
     async function requestLocalChat(body, cfg) {
-        const url = `http://${cfg.address}:${cfg.port}/api/v1/chat`;
+        const selection = await resolveLocalChatModelSelection(cfg);
+        const url = `${getLocalApiBaseUrl(cfg)}/api/v1/chat`;
+        const requestBody = { ...body, model: selection.requestedModel };
         let resp;
         try {
             resp = await fetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body)
+                body: JSON.stringify(requestBody)
             });
         } catch (e) {
             throw new Error(`Local LLM request failed: ${e && e.message ? e.message : e}`);
@@ -273,17 +431,21 @@
             const status = resp ? `${resp.status} ${resp.statusText}` : 'no response';
             throw new Error(`Local LLM error: ${status}`);
         }
-        return resp.json();
+        const data = await resp.json();
+        assertLocalChatResponseMatchesSelection(data, selection);
+        return data;
     }
 
     async function requestLocalChatStream(body, cfg, onDelta, signal) {
-        const url = `http://${cfg.address}:${cfg.port}/api/v1/chat`;
+        const selection = await resolveLocalChatModelSelection(cfg);
+        const url = `${getLocalApiBaseUrl(cfg)}/api/v1/chat`;
+        const requestBody = { ...body, model: selection.requestedModel };
         let resp;
         try {
             resp = await fetch(url, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
+                body: JSON.stringify(requestBody),
                 signal
             });
         } catch (e) {
@@ -315,7 +477,21 @@
                 const events = sse.feed(chunk);
                 for (const evt of events) {
                     if (!evt) continue;
-                    if (evt.type === 'message.delta' && typeof evt.content === 'string') {
+                    if (evt.type === 'model_load.start') {
+                        const instanceId = typeof evt.model_instance_id === 'string' && evt.model_instance_id.trim()
+                            ? evt.model_instance_id.trim()
+                            : selection.expectedInstanceId;
+                        throw new Error(
+                            `Local LLM auto-loaded "${instanceId}" unexpectedly. The configured model must already be loaded in LM Studio.`
+                        );
+                    } else if (evt.type === 'chat.start' && typeof evt.model_instance_id === 'string' && evt.model_instance_id.trim()) {
+                        const responseInstanceId = evt.model_instance_id.trim();
+                        if (responseInstanceId !== selection.expectedInstanceId) {
+                            throw new Error(
+                                `Local LLM stream started with instance "${responseInstanceId}", but "${selection.expectedInstanceId}" was required.`
+                            );
+                        }
+                    } else if (evt.type === 'message.delta' && typeof evt.content === 'string') {
                         const cleaned = thinkStripper.feed(evt.content);
                         if (cleaned) {
                             accumulatedMessage += cleaned;
@@ -325,6 +501,7 @@
                             }
                         }
                     } else if (evt.type === 'chat.end' && evt.result) {
+                        assertLocalChatResponseMatchesSelection(evt.result, selection);
                         finalMessage = extractMessageContentFromV1(evt.result);
                     }
                 }

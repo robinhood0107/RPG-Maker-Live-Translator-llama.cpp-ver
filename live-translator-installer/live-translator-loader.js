@@ -341,6 +341,14 @@
                 const url = new URL(script, supportDir).href;
                 await injectScript(url);
                 logger.debug(`[LiveTranslatorLoader] Loaded script ${script}`);
+                if (script === 'translator.js'
+                    && window.LiveTranslatorConfig
+                    && String(window.LiveTranslatorConfig.provider || '').trim().toLowerCase() === 'local'
+                    && window.TextProcessor
+                    && typeof window.TextProcessor.validateConfiguredLocalModel === 'function') {
+                    await window.TextProcessor.validateConfiguredLocalModel();
+                    logger.debug('[LiveTranslatorLoader] Validated configured local model selection.');
+                }
             }
             logger.info('[LiveTranslatorLoader] All scripts loaded.');
             try { earlyDiag.log('INFO', '[LiveTranslatorLoader] Bootstrap completed successfully'); } catch (_) {}
