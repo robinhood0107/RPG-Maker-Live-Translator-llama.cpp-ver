@@ -219,6 +219,20 @@
         }
     }
 
+    function validateGameMessageSettings(settings, logger) {
+        if (!settings || typeof settings !== 'object') return;
+        const gameMessage = settings.gameMessage;
+        if (!gameMessage || typeof gameMessage !== 'object') return;
+
+        const raw = gameMessage.textScale;
+        if (raw === undefined || raw === null || raw === '') return;
+
+        const numeric = Number(raw);
+        if (!Number.isInteger(numeric) || numeric < 1 || numeric > 100) {
+            logger.warn('[LiveTranslator][Config] settings.json "gameMessage.textScale" should be an integer from 1 to 100. Falling back to 100.');
+        }
+    }
+
     function validateJsonSanity(assets, logger) {
         const cfg = assets['translator.json'] && assets['translator.json'].json;
         if (!cfg || typeof cfg !== 'object') {
@@ -251,6 +265,7 @@
         if (!settings || typeof settings !== 'object') {
             throw new Error('[LiveTranslator][Config] settings.json missing or invalid.');
         }
+        validateGameMessageSettings(settings, logger);
     }
 
     async function bootstrap() {

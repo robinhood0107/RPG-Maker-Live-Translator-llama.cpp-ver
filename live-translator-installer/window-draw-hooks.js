@@ -680,6 +680,14 @@
                     }
                 } catch (_) {}
 
+                try {
+                    if (this && this.constructor
+                        && (this.constructor.name === 'Window_Message'
+                            || this.constructor.name === 'Window_Message_Battle')) {
+                        return invokeOriginalDrawTextEx();
+                    }
+                } catch (_) {}
+
                 let convertedText = textStr;
                 let convertedTrimmed = rawTrimmed;
                 try {

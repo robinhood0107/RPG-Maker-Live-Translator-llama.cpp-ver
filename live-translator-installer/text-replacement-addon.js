@@ -324,8 +324,7 @@
         trackPixiText,
         trackBitmapDrawText,
         trackHelpWindow,
-        drawMessageFaceIfNeeded,
-        resolveMessageStartCoordinates,
+        redrawGameMessageText,
     } = textHookFactory({
         logger,
         dbg,
@@ -336,6 +335,7 @@
         restoreControlCodes,
         telemetry,
         translationCache,
+        settings: cachedSettings,
         captureBitmapDrawState,
         applyBitmapDrawState,
         generateKey,
@@ -475,20 +475,7 @@
                     const pending = this._trPendingRedraw;
                     if (pending && this.visible && this.isOpen() && this.contents) {
                         if (this._trSessionId === pending.sessionId) {
-                            try { this.contents.clear(); } catch (e) {}
-                            if (typeof this.resetFontSettings === 'function') this.resetFontSettings();
-                            drawMessageFaceIfNeeded(this);
-                            const coords = resolveMessageStartCoordinates(this, pending);
-                            const signed = REDRAW_SIGNATURE + pending.text;
-                            this._trBypassProcessCharacter = (this._trBypassProcessCharacter || 0) + 1;
-                            try {
-                                this.drawTextEx(signed, coords.x, coords.y);
-                                if (this._textState) this._textState.index = this._textState.text.length;
-                                this._showFast = true;
-                                this._lineShowFast = true;
-                            } finally {
-                                this._trBypassProcessCharacter = Math.max(0, (this._trBypassProcessCharacter || 1) - 1);
-                            }
+                            redrawGameMessageText(this, pending.text, pending);
                         }
                         this._trPendingRedraw = null;
                     }

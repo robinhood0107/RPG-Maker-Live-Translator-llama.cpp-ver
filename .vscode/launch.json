@@ -32,7 +32,8 @@
                 "experimentation_s",
                 "experimentation_b",
                 "experimentation_l",
-                "experimentation"
+                "experimentation",
+                                "experimentation_user"
             ],
             "default": "experimentation"
         }

@@ -20,6 +20,7 @@
             restoreControlCodes,
             telemetry,
             translationCache,
+            settings,
             captureBitmapDrawState,
             applyBitmapDrawState,
             generateKey,
@@ -108,6 +109,135 @@
         const message = typeof error.message === 'string' ? error.message : String(error);
         return /\bAbortError\b/i.test(message) || /\baborted\b/i.test(message);
     };
+
+    function resolveGameMessageTextScale(config) {
+        const fallback = 100;
+        if (!config || typeof config !== 'object') return fallback;
+        const gameMessage = config.gameMessage;
+        if (!gameMessage || typeof gameMessage !== 'object') return fallback;
+
+        const raw = gameMessage.textScale;
+
+        const numeric = Number(raw);
+        if (!Number.isInteger(numeric) || numeric < 1 || numeric > 100) {
+            return fallback;
+        }
+        return numeric;
+    }
+
+    const gameMessageTextScale = resolveGameMessageTextScale(settings);
+
+    function createGameMessageTextScaleScope(windowInstance, scalePercent) {
+        if (!windowInstance || !windowInstance.contents) return null;
+        if (!Number.isInteger(scalePercent) || scalePercent <= 0 || scalePercent >= 100) return null;
+
+        const scaleFactor = scalePercent / 100;
+        const contents = windowInstance.contents;
+        const originalState = captureBitmapDrawState(contents);
+        const wrappedMethods = [];
+        let logicalFontSize = originalState && Number.isFinite(originalState.fontSize)
+            ? originalState.fontSize
+            : null;
+
+        const refreshLogicalFontSize = () => {
+            const current = contents ? Number(contents.fontSize) : NaN;
+            if (Number.isFinite(current) && current > 0) {
+                logicalFontSize = current;
+            }
+        };
+
+        const applyScaledFontSize = () => {
+            if (!contents || !Number.isFinite(logicalFontSize) || logicalFontSize <= 0) return;
+            contents.fontSize = Math.max(1, Math.round(logicalFontSize * scaleFactor));
+        };
+
+        const wrapMethod = (name, factory) => {
+            const original = windowInstance[name];
+            if (typeof original !== 'function') return;
+            wrappedMethods.push({
+                name,
+                original,
+                hadOwnProperty: Object.prototype.hasOwnProperty.call(windowInstance, name),
+            });
+            windowInstance[name] = factory(original);
+        };
+
+        const invokeWithLogicalFontSize = (original, context, args) => {
+            if (contents && Number.isFinite(logicalFontSize) && logicalFontSize > 0) {
+                contents.fontSize = logicalFontSize;
+            }
+            const result = original.apply(context, args);
+            if (context && context.contents === contents) {
+                refreshLogicalFontSize();
+            }
+            applyScaledFontSize();
+            return result;
+        };
+
+        wrapMethod('resetFontSettings', (original) => function(...args) {
+            const result = original.apply(this, args);
+            if (this && this.contents === contents) {
+                refreshLogicalFontSize();
+            }
+            applyScaledFontSize();
+            return result;
+        });
+
+        wrapMethod('makeFontBigger', (original) => function(...args) {
+            return invokeWithLogicalFontSize(original, this, args);
+        });
+
+        wrapMethod('makeFontSmaller', (original) => function(...args) {
+            return invokeWithLogicalFontSize(original, this, args);
+        });
+
+        applyScaledFontSize();
+
+        return {
+            restore() {
+                for (let i = wrappedMethods.length - 1; i >= 0; i -= 1) {
+                    const wrapped = wrappedMethods[i];
+                    try {
+                        if (wrapped.hadOwnProperty) {
+                            windowInstance[wrapped.name] = wrapped.original;
+                        } else {
+                            delete windowInstance[wrapped.name];
+                        }
+                    } catch (_) {}
+                }
+                if (windowInstance.contents === contents && originalState) {
+                    try { applyBitmapDrawState(contents, originalState); } catch (_) {}
+                }
+            }
+        };
+    }
+
+    function redrawGameMessageText(windowInstance, text, overrides = {}) {
+        if (!windowInstance || !windowInstance.contents) return false;
+
+        try { windowInstance.contents.clear(); } catch (_) {}
+        if (typeof windowInstance.resetFontSettings === 'function') windowInstance.resetFontSettings();
+        drawMessageFaceIfNeeded(windowInstance);
+
+        const coords = resolveMessageStartCoordinates(windowInstance, overrides);
+        const signed = REDRAW_SIGNATURE + text;
+        windowInstance._trBypassProcessCharacter = (windowInstance._trBypassProcessCharacter || 0) + 1;
+        const scaleScope = createGameMessageTextScaleScope(windowInstance, gameMessageTextScale);
+        try {
+            windowInstance.drawTextEx(signed, coords.x, coords.y);
+            if (windowInstance._textState) {
+                windowInstance._textState.index = windowInstance._textState.text.length;
+            }
+            windowInstance._showFast = true;
+            windowInstance._lineShowFast = true;
+        } finally {
+            if (scaleScope) {
+                scaleScope.restore();
+            }
+            windowInstance._trBypassProcessCharacter = Math.max(0, (windowInstance._trBypassProcessCharacter || 1) - 1);
+        }
+        return true;
+    }
 
     function createEscapeAwarePayload(rawText, context = 'message') {
         const resolved = String(rawText || '');
@@ -217,24 +347,7 @@
                 windowInstance._trPendingRedraw = { text, sessionId, x: coords.x, y: coords.y };
                 return false;
             }
-
-            try { windowInstance.contents.clear(); } catch (_) {}
-            if (typeof windowInstance.resetFontSettings === 'function') windowInstance.resetFontSettings();
-            drawMessageFaceIfNeeded(windowInstance);
-
-            const signed = REDRAW_SIGNATURE + text;
-            windowInstance._trBypassProcessCharacter = (windowInstance._trBypassProcessCharacter || 0) + 1;
-            try {
-                windowInstance.drawTextEx(signed, coords.x, coords.y);
-                if (windowInstance._textState) {
-                    windowInstance._textState.index = windowInstance._textState.text.length;
-                }
-                windowInstance._showFast = true;
-                windowInstance._lineShowFast = true;
-            } finally {
-                windowInstance._trBypassProcessCharacter = Math.max(0, (windowInstance._trBypassProcessCharacter || 1) - 1);
-            }
-            return true;
+            return redrawGameMessageText(windowInstance, text, overrides);
         };
 
         // Prefer hooking startMessage to get full resolved text once
@@ -294,7 +407,10 @@
             }
 
             // If startMessage already handled this session, skip accumulation to avoid truncation issues
-            if (gameMessageState.isActive && this._trStartedThisSession && this._trMessageSession === gameMessageState.session) {
+            if (gameMessageState.isActive
+                && this._trStartedThisSession
+                && this._trSentTranslateThisSession
+                && this._trMessageSession === gameMessageState.session) {
                 return originalProcessCharacter.call(this, textState);
             }
 
@@ -728,8 +844,8 @@
 
             const shouldTraceBitmapDiagnostics = () => !!(logger && typeof logger.shouldLog === 'function' && logger.shouldLog('trace'));
 
-            const captureBitmapCallSite = () => {
-                if (!shouldTraceBitmapDiagnostics()) return '';
+            const captureBitmapCallSite = (force = false) => {
+                if (!force && !shouldTraceBitmapDiagnostics()) return '';
                 try {
                     const stack = new Error().stack;
                     if (!stack) return '';
@@ -1949,6 +2065,13 @@
 
                 const owner = contentsOwners && contentsOwners.get ? contentsOwners.get(bitmap) : null;
                 const ownerType = owner && owner.constructor ? owner.constructor.name : (bitmap.constructor ? bitmap.constructor.name : 'Bitmap');
+                const debugCallSite = captureBitmapCallSite(!owner || ownerType === 'Bitmap');
+                if (!owner
+                    && ownerType === 'Bitmap'
+                    && /\bprocessNormalCharacter\b/.test(debugCallSite)) {
+                    diag(`[bitmap/bypass-normal-char] ${describeBitmap(bitmap, owner)} text="${preview(stripRpgmEscapes(textStr))}"${debugCallSite ? ` site=${debugCallSite}` : ''}`);
+                    return originalFn.apply(bitmap, callArgs);
+                }
                 if (hasDedicatedOwnerHook(owner) || bitmap._trHasDedicatedTextHook) {
                     diag(`[bitmap/bypass-owner] ${describeBitmap(bitmap, owner)} text="${preview(stripRpgmEscapes(textStr))}"`);
                     return originalFn.apply(bitmap, callArgs);
@@ -1969,9 +2092,6 @@
                     : (bitmap.fontSize || 24);
                 const widthEstimate = estimateWidth(bitmap, textStr, maxWidth);
                 const drawState = captureBitmapDrawState(bitmap);
-                const debugCallSite = shouldTraceBitmapDiagnostics() && (!owner || ownerType === 'Bitmap' || /\d/.test(stripRpgmEscapes(textStr || '')))
-                    ? captureBitmapCallSite()
-                    : '';
                 const fragment = {
                     methodName,
                     rawText: textStr,
@@ -2155,6 +2275,7 @@
             trackBitmapDrawText,
             trackHelpWindow,
             drawMessageFaceIfNeeded,
+            redrawGameMessageText,
             resolveMessageStartCoordinates,
         };
     };

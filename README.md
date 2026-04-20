@@ -45,4 +45,6 @@ To translate other languages than Chinese, Japanese, or Korean, set `"disableCjk
 
 1.10 - fix longstanding errorneous bitmap clear problems
 
+1.11 - fix non-CJK games (English) and add an option to resize game_message
+
 ![License](https://img.shields.io/badge/License-CC%20BY%204.0-blue.svg)
