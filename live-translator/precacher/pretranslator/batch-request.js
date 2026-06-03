@@ -9,7 +9,7 @@ const {
     RAW_CONTROL_CODE_PATTERN,
 } = require('./constants');
 const { assertNotAborted, createAbortError, isAbortError } = require('./abort');
-const { assertFetchAvailable, getLocalApiBaseUrl } = require('./local-model');
+const { assertFetchAvailable, getLocalChatUrl } = require('./local-model');
 const { formatError } = require('./formatting');
 
 function buildBatchSystemPrompt(cfg) {
@@ -34,6 +34,26 @@ function getMaxOutputTokensForBatch(items, cfg) {
 function buildLocalChatBody(items, cfg, selection) {
     const input = buildBatchInput(items);
     const systemPrompt = buildBatchSystemPrompt(cfg);
+    if (cfg && cfg.api_type === 'llamacpp') {
+        const body = {
+            model: selection.requestedModel,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: input },
+            ],
+            stream: false,
+            max_tokens: getMaxOutputTokensForBatch(items, cfg),
+        };
+
+        if (Number.isFinite(cfg.temperature)) body.temperature = cfg.temperature;
+        if (Number.isFinite(cfg.top_p)) body.top_p = cfg.top_p;
+        if (Number.isFinite(cfg.top_k)) body.top_k = cfg.top_k;
+        if (Number.isFinite(cfg.min_p)) body.min_p = cfg.min_p;
+        if (Number.isFinite(cfg.repeat_penalty)) body.repeat_penalty = cfg.repeat_penalty;
+
+        return body;
+    }
+
     const body = {
         input,
         stream: false,
@@ -55,7 +75,7 @@ function buildLocalChatBody(items, cfg, selection) {
 async function requestLocalBatch(items, cfg, selection, options = {}) {
     assertFetchAvailable();
     assertNotAborted(options.signal);
-    const url = `${getLocalApiBaseUrl(cfg)}/api/v1/chat`;
+    const url = getLocalChatUrl(cfg);
     const body = buildLocalChatBody(items, cfg, selection);
     let response;
     try {
@@ -81,6 +101,16 @@ async function requestLocalBatch(items, cfg, selection, options = {}) {
 }
 
 function assertLocalChatResponseMatchesSelection(data, selection) {
+    if (selection && selection.apiType === 'llamacpp') {
+        const responseModel = data && typeof data.model === 'string' ? data.model.trim() : '';
+        if (responseModel && responseModel !== selection.expectedInstanceId) {
+            throw new Error(
+                `Local LLM responded with model "${responseModel}", but "${selection.expectedInstanceId}" was requested.`
+            );
+        }
+        return;
+    }
+
     const responseInstanceId = data && typeof data.model_instance_id === 'string'
         ? data.model_instance_id.trim()
         : '';
@@ -112,11 +142,18 @@ function extractMessageContent(data) {
 }
 
 function sanitizeModelOutput(text) {
-    let out = String(text || '');
+    let out = stripLocalSpecialTokens(text);
     out = out.replace(/<\s*think\b[\s\S]*?>[\s\S]*?<\s*\/\s*think\s*>/gi, '');
     out = out.trim();
     out = out.replace(/^```(?:jsonl|json)?\s*([\s\S]*?)\s*```$/iu, '$1').trim();
     return out;
+}
+
+function stripLocalSpecialTokens(value) {
+    return String(value || '')
+        .replace(/<\|channel\>\s*[^<\r\n]+\s*<channel\|>/gi, '')
+        .replace(/<\|channel\>\s*[^<\r\n]*/gi, '')
+        .replace(/<channel\|>/gi, '');
 }
 
 function parseBatchTranslations(text, expectedItems) {
@@ -210,4 +247,5 @@ module.exports = {
     parseJsonRows,
     requestLocalBatch,
     sanitizeModelOutput,
+    stripLocalSpecialTokens,
 };

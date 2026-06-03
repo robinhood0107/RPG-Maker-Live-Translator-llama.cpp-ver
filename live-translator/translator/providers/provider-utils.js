@@ -72,6 +72,16 @@
             : '';
     }
 
+    function normalizeLocalApiType(value) {
+        const raw = typeof value === 'string' && value.trim()
+            ? value.trim().toLowerCase()
+            : 'lmstudio';
+        const compact = raw.replace(/[\s_.-]+/g, '');
+        if (compact === 'llamacpp' || compact === 'llama') return 'llamacpp';
+        if (compact === 'openai' || compact === 'openaicompatible') return 'llamacpp';
+        return 'lmstudio';
+    }
+
     function getTranslationSettings(settings) {
         return settings && settings.translation && typeof settings.translation === 'object'
             ? settings.translation
@@ -116,6 +126,7 @@
                 : root;
 
         const out = {
+            api_type: normalizeLocalApiType(source.api_type || source.apiType || source.api),
             address: source.address || source.Address || '127.0.0.1',
             port: positiveInteger(source.port || source.Port, 1234),
             model: typeof source.model === 'string' ? source.model.trim() : '',
@@ -291,6 +302,20 @@
         return `http://${cfg.address}:${cfg.port}`;
     }
 
+    function getLocalModelsUrl(cfg) {
+        const baseUrl = getLocalApiBaseUrl(cfg);
+        return cfg && cfg.api_type === 'llamacpp'
+            ? `${baseUrl}/v1/models`
+            : `${baseUrl}/api/v1/models`;
+    }
+
+    function getLocalChatUrl(cfg) {
+        const baseUrl = getLocalApiBaseUrl(cfg);
+        return cfg && cfg.api_type === 'llamacpp'
+            ? `${baseUrl}/v1/chat/completions`
+            : `${baseUrl}/api/v1/chat`;
+    }
+
     defineRuntimeModule('runtime.translationProviderUtils', {
         DEFAULT_LOCAL_MAX_OUTPUT_TOKENS,
         DEFAULT_MODEL_CATALOG_TTL_MS,
@@ -305,6 +330,7 @@
         finiteNumber,
         positiveInteger,
         normalizeProviderName,
+        normalizeLocalApiType,
         normalizeLocalConfig,
         normalizeDeepLConfig,
         createAbortError,
@@ -314,5 +340,7 @@
         coerceFetchError,
         markHttpError,
         getLocalApiBaseUrl,
+        getLocalModelsUrl,
+        getLocalChatUrl,
     });
 })();
