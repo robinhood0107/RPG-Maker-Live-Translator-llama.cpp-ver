@@ -38,7 +38,8 @@
         getFetch,
         getGlobalSettings,
         getGlobalTranslatorConfig,
-        getLocalApiBaseUrl,
+        getLocalChatUrl,
+        getLocalModelsUrl,
         markHttpError,
         normalizeLocalConfig,
         positiveInteger,
@@ -48,7 +49,11 @@
         buildLocalChatBody,
         createSseParser,
         createThinkBlockStripper,
+        extractMessageContentFromLocalResponse,
         extractMessageContentFromV1,
+        extractOpenAiStreamDeltaContent,
+        isLlamaCppConfig,
+        normalizeLocalModelCatalog,
         parseLocalTextOutput,
         selectLocalChatModel,
     } = protocol;
@@ -66,7 +71,7 @@
                 signal: requestOptions.signal,
                 timeoutMs: requestOptions.timeoutMs || cfg.model_catalog_timeout_ms,
             });
-            const url = `${getLocalApiBaseUrl(cfg)}/api/v1/models`;
+            const url = getLocalModelsUrl(cfg);
             try {
                 const response = await fetchImpl(url, { method: 'GET', signal: linked.signal });
                 if (!response || !response.ok) {
@@ -75,10 +80,7 @@
                     throw markHttpError(new Error(`Local LLM model list error: ${status} ${statusText}`), status);
                 }
                 const data = await response.json();
-                if (!data || !Array.isArray(data.models)) {
-                    throw new Error('Local LLM models response missing required "models" array.');
-                }
-                return data.models;
+                return normalizeLocalModelCatalog(data, cfg);
             } catch (error) {
                 const converted = coerceFetchError(error, linked, 'Local LLM model list request failed');
                 throw converted;
@@ -121,7 +123,7 @@
                 signal: requestOptions.signal,
                 timeoutMs: requestOptions.timeoutMs || cfg.request_timeout_ms,
             });
-            const url = `${getLocalApiBaseUrl(cfg)}/api/v1/chat`;
+            const url = getLocalChatUrl(cfg);
             const requestBody = { ...body, model: selection.requestedModel };
             try {
                 const response = await fetchImpl(url, {
@@ -137,7 +139,7 @@
                 }
                 const data = await response.json();
                 assertLocalChatResponseMatchesSelection(data, selection);
-                return data;
+                return { data, selection };
             } catch (error) {
                 const converted = coerceFetchError(error, linked, 'Local LLM request failed');
                 if (/model|instance|loaded/i.test(converted && converted.message ? converted.message : '')) {
@@ -155,7 +157,7 @@
                 signal: requestOptions.signal,
                 timeoutMs: requestOptions.timeoutMs || cfg.request_timeout_ms,
             });
-            const url = `${getLocalApiBaseUrl(cfg)}/api/v1/chat`;
+            const url = getLocalChatUrl(cfg);
             const requestBody = { ...body, model: selection.requestedModel };
             const onDelta = typeof requestOptions.onDelta === 'function' ? requestOptions.onDelta : null;
             let reader = null;
@@ -190,6 +192,25 @@
                     const events = sse.feed(decoder.decode(value, { stream: true }));
                     for (const event of events) {
                         if (!event) continue;
+                        if (isLlamaCppConfig(cfg)) {
+                            if (event.error) {
+                                const message = event.error.message || event.error || 'Local LLM stream error.';
+                                const error = new Error(String(message));
+                                try { error.retryable = true; } catch (_) {}
+                                throw error;
+                            }
+
+                            const cleaned = thinkStripper.feed(extractOpenAiStreamDeltaContent(event));
+                            if (cleaned) {
+                                accumulatedMessage += cleaned;
+                                if (onDelta && accumulatedMessage !== lastPartial) {
+                                    lastPartial = accumulatedMessage;
+                                    onDelta(accumulatedMessage);
+                                }
+                            }
+                            continue;
+                        }
+
                         if (event.type === 'model_load.start') {
                             const instanceId = typeof event.model_instance_id === 'string' && event.model_instance_id.trim()
                                 ? event.model_instance_id.trim()
@@ -245,8 +266,8 @@
 
         async function translateOneLocal(text, requestOptions = {}) {
             const sourceText = String(text ?? '');
-            const data = await requestLocalChat(buildLocalChatBody(sourceText, cfg, false), requestOptions);
-            return parseLocalTextOutput(extractMessageContentFromV1(data));
+            const response = await requestLocalChat(buildLocalChatBody(sourceText, cfg, false), requestOptions);
+            return parseLocalTextOutput(extractMessageContentFromLocalResponse(response.data, response.selection));
         }
 
         async function translateOneLocalStream(text, requestOptions = {}) {

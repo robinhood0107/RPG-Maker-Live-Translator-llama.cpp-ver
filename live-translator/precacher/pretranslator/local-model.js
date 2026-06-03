@@ -27,6 +27,7 @@ function normalizeLocalConfig(rootConfig) {
     }
 
     const out = {
+        api_type: normalizeLocalApiType(cfg.api_type || cfg.apiType || cfg.api),
         address: cfg.Address || cfg.address || '127.0.0.1',
         port: Number(cfg.port || cfg.Port || 1234),
         model: cfg.model || cfg.Model || null,
@@ -46,6 +47,16 @@ function normalizeLocalConfig(rootConfig) {
     return out;
 }
 
+function normalizeLocalApiType(value) {
+    const raw = typeof value === 'string' && value.trim()
+        ? value.trim().toLowerCase()
+        : 'lmstudio';
+    const compact = raw.replace(/[\s_.-]+/g, '');
+    if (compact === 'llamacpp' || compact === 'llama') return 'llamacpp';
+    if (compact === 'openai' || compact === 'openaicompatible') return 'llamacpp';
+    return 'lmstudio';
+}
+
 function optionalNumber(value) {
     const numeric = Number(value);
     return Number.isFinite(numeric) ? numeric : null;
@@ -55,10 +66,24 @@ function getLocalApiBaseUrl(cfg) {
     return `http://${cfg.address}:${cfg.port}`;
 }
 
+function getLocalModelsUrl(cfg) {
+    const baseUrl = getLocalApiBaseUrl(cfg);
+    return cfg && cfg.api_type === 'llamacpp'
+        ? `${baseUrl}/v1/models`
+        : `${baseUrl}/api/v1/models`;
+}
+
+function getLocalChatUrl(cfg) {
+    const baseUrl = getLocalApiBaseUrl(cfg);
+    return cfg && cfg.api_type === 'llamacpp'
+        ? `${baseUrl}/v1/chat/completions`
+        : `${baseUrl}/api/v1/chat`;
+}
+
 async function requestLocalModelCatalog(cfg, options = {}) {
     assertFetchAvailable();
     assertNotAborted(options.signal);
-    const url = `${getLocalApiBaseUrl(cfg)}/api/v1/models`;
+    const url = getLocalModelsUrl(cfg);
     let response;
     try {
         response = await fetch(url, { method: 'GET', signal: options.signal });
@@ -71,10 +96,7 @@ async function requestLocalModelCatalog(cfg, options = {}) {
         throw new Error(`Local LLM model list error: ${status}`);
     }
     const data = await response.json();
-    if (!data || !Array.isArray(data.models)) {
-        throw new Error('Local LLM models response missing required "models" array.');
-    }
-    return data.models;
+    return normalizeLocalModelCatalog(data, cfg);
 }
 
 function assertFetchAvailable() {
@@ -99,6 +121,42 @@ function getLoadedLlmInstances(models) {
     return out;
 }
 
+function normalizeLocalModelCatalog(data, cfg) {
+    if (cfg && cfg.api_type === 'llamacpp') {
+        if (data && Array.isArray(data.data)) return data.data;
+        if (data && Array.isArray(data.models)) return data.models;
+        if (Array.isArray(data)) return data;
+        throw new Error('Local LLM models response missing required "data" array.');
+    }
+    if (!data || !Array.isArray(data.models)) {
+        throw new Error('Local LLM models response missing required "models" array.');
+    }
+    return data.models;
+}
+
+function getOpenAiModelIds(models) {
+    const ids = [];
+    for (const model of Array.isArray(models) ? models : []) {
+        const id = typeof model === 'string'
+            ? model.trim()
+            : model && typeof model.id === 'string'
+                ? model.id.trim()
+                : model && typeof model.key === 'string'
+                    ? model.key.trim()
+                    : model && typeof model.model === 'string'
+                        ? model.model.trim()
+                        : model && typeof model.name === 'string'
+                            ? model.name.trim()
+                            : '';
+        if (id && !ids.includes(id)) ids.push(id);
+    }
+    return ids;
+}
+
+function describeOpenAiModels(ids) {
+    return Array.isArray(ids) && ids.length ? ids.join(', ') : 'none';
+}
+
 function describeLoadedLlmInstances(instances) {
     const list = Array.isArray(instances) ? instances : [];
     if (!list.length) return 'none';
@@ -110,6 +168,34 @@ function describeLoadedLlmInstances(instances) {
 async function resolveLocalChatModelSelection(cfg, options = {}) {
     const configuredModel = String(cfg.model || '').trim();
     const models = await requestLocalModelCatalog(cfg, options);
+    if (cfg && cfg.api_type === 'llamacpp') {
+        const modelIds = getOpenAiModelIds(models);
+        if (configuredModel.toLowerCase() === 'auto') {
+            if (modelIds.length !== 1) {
+                throw new Error(
+                    `settings.local.model is "auto", but llama.cpp /v1/models returned ${modelIds.length} model(s): `
+                    + `${describeOpenAiModels(modelIds)}.`
+                );
+            }
+            return {
+                apiType: 'llamacpp',
+                requestedModel: modelIds[0],
+                expectedInstanceId: modelIds[0],
+            };
+        }
+        if (modelIds.includes(configuredModel)) {
+            return {
+                apiType: 'llamacpp',
+                requestedModel: configuredModel,
+                expectedInstanceId: configuredModel,
+            };
+        }
+        throw new Error(
+            `Configured model "${configuredModel}" was not found in llama.cpp /v1/models: `
+            + `${describeOpenAiModels(modelIds)}.`
+        );
+    }
+
     const loadedInstances = getLoadedLlmInstances(models);
 
     if (configuredModel.toLowerCase() === 'auto') {
@@ -120,6 +206,7 @@ async function resolveLocalChatModelSelection(cfg, options = {}) {
             );
         }
         return {
+            apiType: 'lmstudio',
             requestedModel: loadedInstances[0].instanceId,
             expectedInstanceId: loadedInstances[0].instanceId,
         };
@@ -140,6 +227,7 @@ async function resolveLocalChatModelSelection(cfg, options = {}) {
             );
         }
         return {
+            apiType: 'lmstudio',
             requestedModel: instances[0].instanceId,
             expectedInstanceId: instances[0].instanceId,
         };
@@ -148,6 +236,7 @@ async function resolveLocalChatModelSelection(cfg, options = {}) {
     const exactInstance = loadedInstances.find((instance) => instance.instanceId === configuredModel);
     if (exactInstance) {
         return {
+            apiType: 'lmstudio',
             requestedModel: exactInstance.instanceId,
             expectedInstanceId: exactInstance.instanceId,
         };
@@ -161,7 +250,12 @@ module.exports = {
     describeLoadedLlmInstances,
     getLoadedLlmInstances,
     getLocalApiBaseUrl,
+    getLocalChatUrl,
+    getLocalModelsUrl,
+    getOpenAiModelIds,
+    normalizeLocalApiType,
     normalizeLocalConfig,
+    normalizeLocalModelCatalog,
     optionalNumber,
     requestLocalModelCatalog,
     resolveLocalChatModelSelection,

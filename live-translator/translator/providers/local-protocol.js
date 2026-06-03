@@ -98,7 +98,88 @@
             .filter((instance) => instance.instanceId);
     }
 
+    function isLlamaCppConfig(cfg) {
+        return cfg && cfg.api_type === 'llamacpp';
+    }
+
+    function normalizeLocalModelCatalog(data, cfg) {
+        if (isLlamaCppConfig(cfg)) {
+            if (data && Array.isArray(data.data)) return data.data;
+            if (data && Array.isArray(data.models)) return data.models;
+            if (Array.isArray(data)) return data;
+            throw new Error('Local LLM models response missing required "data" array.');
+        }
+        if (!data || !Array.isArray(data.models)) {
+            throw new Error('Local LLM models response missing required "models" array.');
+        }
+        return data.models;
+    }
+
+    function getOpenAiModelIds(models) {
+        const ids = [];
+        const list = Array.isArray(models) ? models : [];
+        for (const model of list) {
+            const id = typeof model === 'string'
+                ? model.trim()
+                : model && typeof model.id === 'string'
+                    ? model.id.trim()
+                    : model && typeof model.key === 'string'
+                        ? model.key.trim()
+                        : model && typeof model.model === 'string'
+                            ? model.model.trim()
+                            : model && typeof model.name === 'string'
+                                ? model.name.trim()
+                                : '';
+            if (id && !ids.includes(id)) ids.push(id);
+        }
+        return ids;
+    }
+
+    function describeOpenAiModels(ids) {
+        return Array.isArray(ids) && ids.length ? ids.join(', ') : 'none';
+    }
+
+    function selectOpenAiChatModel(models, cfg) {
+        const configuredModel = typeof cfg.model === 'string' ? cfg.model.trim() : '';
+        const modelIds = getOpenAiModelIds(models);
+
+        if (configuredModel.toLowerCase() === 'auto') {
+            if (modelIds.length !== 1) {
+                throw new Error(
+                    `settings.local.model is "auto", but llama.cpp /v1/models returned ${modelIds.length} model(s): `
+                    + `${describeOpenAiModels(modelIds)}. Start llama.cpp with one model or set settings.local.model to a specific model id.`
+                );
+            }
+            return {
+                apiType: 'llamacpp',
+                configuredModel,
+                requestedModel: modelIds[0],
+                expectedInstanceId: modelIds[0],
+                capacity: 1,
+            };
+        }
+
+        if (modelIds.includes(configuredModel)) {
+            return {
+                apiType: 'llamacpp',
+                configuredModel,
+                requestedModel: configuredModel,
+                expectedInstanceId: configuredModel,
+                capacity: 1,
+            };
+        }
+
+        throw new Error(
+            `Configured local model "${configuredModel}" was not found in llama.cpp /v1/models: `
+            + `${describeOpenAiModels(modelIds)}.`
+        );
+    }
+
     function selectLocalChatModel(models, cfg) {
+        if (isLlamaCppConfig(cfg)) {
+            return selectOpenAiChatModel(models, cfg);
+        }
+
         const configuredModel = typeof cfg.model === 'string' ? cfg.model.trim() : '';
         const loadedLlmInstances = getLoadedLlmInstances(models);
 
@@ -110,6 +191,7 @@
                 );
             }
             return {
+                apiType: 'lmstudio',
                 configuredModel,
                 requestedModel: loadedLlmInstances[0].instanceId,
                 expectedInstanceId: loadedLlmInstances[0].instanceId,
@@ -137,6 +219,7 @@
             }
 
             return {
+                apiType: 'lmstudio',
                 configuredModel,
                 requestedModel: loadedInstances[0].instanceId,
                 expectedInstanceId: loadedInstances[0].instanceId,
@@ -147,6 +230,7 @@
         const exactLoadedInstance = loadedLlmInstances.find((instance) => instance.instanceId === configuredModel);
         if (exactLoadedInstance) {
             return {
+                apiType: 'lmstudio',
                 configuredModel,
                 requestedModel: exactLoadedInstance.instanceId,
                 expectedInstanceId: exactLoadedInstance.instanceId,
@@ -158,6 +242,28 @@
     }
 
     function buildLocalChatBody(sourceText, cfg, stream) {
+        if (isLlamaCppConfig(cfg)) {
+            const messages = [];
+            if (typeof cfg.system_prompt === 'string' && cfg.system_prompt) {
+                messages.push({ role: 'system', content: cfg.system_prompt });
+            }
+            messages.push({ role: 'user', content: String(sourceText ?? '') });
+
+            const body = {
+                messages,
+                stream: !!stream,
+            };
+            if (Number.isFinite(cfg.temperature)) body.temperature = cfg.temperature;
+            if (Number.isFinite(cfg.top_p)) body.top_p = cfg.top_p;
+            if (Number.isFinite(cfg.top_k)) body.top_k = cfg.top_k;
+            if (Number.isFinite(cfg.min_p)) body.min_p = cfg.min_p;
+            if (Number.isFinite(cfg.repeat_penalty)) body.repeat_penalty = cfg.repeat_penalty;
+            body.max_tokens = Number.isFinite(cfg.max_output_tokens)
+                ? cfg.max_output_tokens
+                : DEFAULT_LOCAL_MAX_OUTPUT_TOKENS;
+            return body;
+        }
+
         const body = {
             input: String(sourceText ?? ''),
             stream: !!stream,
@@ -183,9 +289,33 @@
         return messages.map((item) => item.content).join('');
     }
 
+    function extractMessageContentFromOpenAi(data) {
+        const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+        if (choice && choice.message && typeof choice.message.content === 'string') {
+            return choice.message.content;
+        }
+        if (choice && typeof choice.text === 'string') {
+            return choice.text;
+        }
+        return '';
+    }
+
+    function extractMessageContentFromLocalResponse(data, selection) {
+        return selection && selection.apiType === 'llamacpp'
+            ? extractMessageContentFromOpenAi(data)
+            : extractMessageContentFromV1(data);
+    }
+
+    function stripLocalSpecialTokens(value) {
+        return String(value || '')
+            .replace(/<\|channel\>\s*[^<\r\n]+\s*<channel\|>/gi, '')
+            .replace(/<\|channel\>\s*[^<\r\n]*/gi, '')
+            .replace(/<channel\|>/gi, '');
+    }
+
     function sanitizeLocalOutput(value) {
         if (typeof value !== 'string') return '';
-        let out = value;
+        let out = stripLocalSpecialTokens(value);
         out = out.replace(/<\s*think\b[\s\S]*?>[\s\S]*?<\s*\/\s*think\s*>/gi, '');
         out = out.replace(/<\s*think\b[\s\S]*?\/>/gi, '');
         out = out.replace(/^```(?:[\w-]+)?\s*([\s\S]*?)\s*```$/u, '$1');
@@ -209,6 +339,16 @@
     }
 
     function assertLocalChatResponseMatchesSelection(data, selection) {
+        if (selection && selection.apiType === 'llamacpp') {
+            const responseModel = data && typeof data.model === 'string' ? data.model.trim() : '';
+            if (responseModel && responseModel !== selection.expectedInstanceId) {
+                throw new Error(
+                    `Local LLM responded with model "${responseModel}", but "${selection.expectedInstanceId}" was requested.`
+                );
+            }
+            return;
+        }
+
         const responseInstanceId = getLocalChatResponseModelInstanceId(data);
         if (responseInstanceId !== selection.expectedInstanceId) {
             throw new Error(
@@ -222,6 +362,15 @@
                 `Local LLM auto-loaded "${responseInstanceId}" unexpectedly. The configured model must already be loaded in LM Studio.`
             );
         }
+    }
+
+    function extractOpenAiStreamDeltaContent(event) {
+        const choice = event && Array.isArray(event.choices) ? event.choices[0] : null;
+        if (!choice) return '';
+        if (choice.delta && typeof choice.delta.content === 'string') return choice.delta.content;
+        if (choice.message && typeof choice.message.content === 'string') return choice.message.content;
+        if (typeof choice.text === 'string') return choice.text;
+        return '';
     }
 
     function createThinkBlockStripper() {
@@ -299,14 +448,21 @@
         getLoadedLlmInstances,
         describeLoadedLlmInstances,
         getLoadedInstancesForModel,
+        isLlamaCppConfig,
+        normalizeLocalModelCatalog,
+        getOpenAiModelIds,
         selectLocalChatModel,
         buildLocalChatBody,
         extractMessageContentFromV1,
+        extractMessageContentFromOpenAi,
+        extractMessageContentFromLocalResponse,
+        stripLocalSpecialTokens,
         sanitizeLocalOutput,
         parseLocalTextOutput,
         getLocalChatResponseModelInstanceId,
         getLocalChatResponseStats,
         assertLocalChatResponseMatchesSelection,
+        extractOpenAiStreamDeltaContent,
         createThinkBlockStripper,
         createSseParser,
     });
