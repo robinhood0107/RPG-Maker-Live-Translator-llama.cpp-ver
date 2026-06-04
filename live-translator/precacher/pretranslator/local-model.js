@@ -36,6 +36,8 @@ function normalizeLocalConfig(rootConfig) {
         top_k: optionalNumber(cfg.top_k || cfg.TopK),
         min_p: optionalNumber(cfg.min_p || cfg.MinP),
         repeat_penalty: optionalNumber(cfg.repeat_penalty || cfg.repeatPenalty || cfg.repetition_penalty),
+        batch_system_prompt: typeof cfg.batch_system_prompt === 'string' ? cfg.batch_system_prompt : '',
+        chat_template_kwargs: plainObjectOrNull(cfg.chat_template_kwargs || cfg.chatTemplateKwargs),
     };
 
     if (!out.model || typeof out.model !== 'string' || !out.model.trim()) {
@@ -60,6 +62,11 @@ function normalizeLocalApiType(value) {
 function optionalNumber(value) {
     const numeric = Number(value);
     return Number.isFinite(numeric) ? numeric : null;
+}
+
+function plainObjectOrNull(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    return JSON.parse(JSON.stringify(value));
 }
 
 function getLocalApiBaseUrl(cfg) {

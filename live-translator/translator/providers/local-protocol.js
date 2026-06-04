@@ -258,6 +258,9 @@
             if (Number.isFinite(cfg.top_k)) body.top_k = cfg.top_k;
             if (Number.isFinite(cfg.min_p)) body.min_p = cfg.min_p;
             if (Number.isFinite(cfg.repeat_penalty)) body.repeat_penalty = cfg.repeat_penalty;
+            if (cfg.chat_template_kwargs && typeof cfg.chat_template_kwargs === 'object') {
+                body.chat_template_kwargs = cfg.chat_template_kwargs;
+            }
             body.max_tokens = Number.isFinite(cfg.max_output_tokens)
                 ? cfg.max_output_tokens
                 : DEFAULT_LOCAL_MAX_OUTPUT_TOKENS;

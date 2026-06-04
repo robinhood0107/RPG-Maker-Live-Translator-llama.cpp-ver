@@ -61,6 +61,11 @@
         return Number.isFinite(numeric) ? numeric : fallback;
     }
 
+    function plainObjectOrNull(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        return JSON.parse(JSON.stringify(value));
+    }
+
     function positiveInteger(value, fallback) {
         const numeric = Number(value);
         return Number.isInteger(numeric) && numeric > 0 ? numeric : fallback;
@@ -137,6 +142,7 @@
             min_p: finiteNumber(source.min_p || source.MinP, null),
             top_p: finiteNumber(source.top_p || source.TopP, 0.95),
             max_output_tokens: resolveLocalMaxOutputTokens(source, settings),
+            chat_template_kwargs: plainObjectOrNull(source.chat_template_kwargs || source.chatTemplateKwargs),
             model_catalog_ttl_ms: positiveInteger(
                 source.model_catalog_ttl_ms || source.modelCatalogTtlMs,
                 positiveInteger(getSettingValue(settings, ['modelCatalogTtlMs', 'model_catalog_ttl_ms'], null), DEFAULT_MODEL_CATALOG_TTL_MS)

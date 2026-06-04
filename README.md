@@ -64,6 +64,9 @@ Then, go to `js/plugins/live-translator/` or `www/js/plugins/live-translator/` t
             "port": 18080,
             "model": "gemma-4-26B-A4B-it-ultra-uncensored-heretic-Q3_K_M.gguf",
             "system_prompt": "Translate the user's text into Korean. Preserve every ¤ character exactly in the right place. Preserve existing line breaks exactly. Return only the translated text.",
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            },
             "temperature": 1,
             "top_p": 0.95,
             "top_k": 64,
