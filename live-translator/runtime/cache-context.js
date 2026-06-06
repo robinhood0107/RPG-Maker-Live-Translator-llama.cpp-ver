@@ -94,6 +94,7 @@
                 settings,
                 logger,
                 fetch: typeof globalScope.fetch === 'function' ? globalScope.fetch.bind(globalScope) : undefined,
+                paths: pathContext,
             });
             const diskCacheFactory = resolveDiskCacheFactory();
             const diskCacheSettings = settings.diskCache || {};

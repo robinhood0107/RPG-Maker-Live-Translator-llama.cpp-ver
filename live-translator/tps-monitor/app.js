@@ -14,6 +14,7 @@
         metricsFile: '',
         analysisLogFile: '',
         analysisSnapshotFile: '',
+        metricsBasePath: '',
         refreshMs: DEFAULT_REFRESH_MS,
         lastLoggedSampleCount: 0,
         timer: null,
@@ -146,6 +147,46 @@
         }
     }
 
+    function getProcessCwd() {
+        try {
+            if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+                const cwd = process.cwd();
+                return typeof cwd === 'string' ? cwd : '';
+            }
+        } catch (_) {}
+        return '';
+    }
+
+    function addCandidatePath(paths, value) {
+        if (!value || !state.path) return;
+        const normalized = state.path.normalize(String(value));
+        if (!paths.includes(normalized)) paths.push(normalized);
+    }
+
+    function getCandidateBasePaths() {
+        const paths = [];
+        addCandidatePath(paths, state.supportPath);
+        addCandidatePath(paths, state.gameRoot);
+        addCandidatePath(paths, getProcessCwd());
+        return paths;
+    }
+
+    function resolveRelativeFile(fileName, basePaths, options = {}) {
+        const raw = String(fileName || '').trim();
+        if (!raw) return '';
+        if (state.path.isAbsolute(raw)) return raw;
+        const candidates = basePaths.length ? basePaths : [''];
+        if (options.preferExisting) {
+            for (const basePath of candidates) {
+                const candidate = state.path.join(basePath, raw);
+                try {
+                    if (state.fs.existsSync(candidate)) return candidate;
+                } catch (_) {}
+            }
+        }
+        return state.path.join(candidates[0] || '', raw);
+    }
+
     function resolvePaths() {
         state.supportPath = getQueryValue('supportPath');
         state.gameRoot = getQueryValue('gameRoot');
@@ -154,16 +195,14 @@
         }
         const settings = readSettings();
         state.refreshMs = settings.refreshMs;
-        const base = state.supportPath || state.gameRoot || '';
-        state.metricsFile = state.path.isAbsolute(settings.metricsLogFile)
-            ? settings.metricsLogFile
-            : state.path.join(base, settings.metricsLogFile);
-        state.analysisLogFile = state.path.isAbsolute(settings.analysisLogFile)
-            ? settings.analysisLogFile
-            : state.path.join(base, settings.analysisLogFile);
-        state.analysisSnapshotFile = state.path.isAbsolute(settings.analysisSnapshotFile)
-            ? settings.analysisSnapshotFile
-            : state.path.join(base, settings.analysisSnapshotFile);
+        const basePaths = getCandidateBasePaths();
+        state.metricsFile = resolveRelativeFile(settings.metricsLogFile, basePaths, { preferExisting: true });
+        state.metricsBasePath = state.path.dirname(state.metricsFile || state.path.join(basePaths[0] || '', DEFAULT_METRICS_LOG));
+        const analysisBasePaths = [];
+        addCandidatePath(analysisBasePaths, state.metricsBasePath);
+        for (const basePath of basePaths) addCandidatePath(analysisBasePaths, basePath);
+        state.analysisLogFile = resolveRelativeFile(settings.analysisLogFile, analysisBasePaths);
+        state.analysisSnapshotFile = resolveRelativeFile(settings.analysisSnapshotFile, analysisBasePaths);
         setText('log-path', `raw: ${state.metricsFile}`);
         setText('analysis-path', `analysis: ${state.analysisSnapshotFile}`);
     }
