@@ -72,6 +72,22 @@
                 return key === 'enter' || code === 'enter' || code === 'numpadenter';
             },
         }, windowContext),
+        tps: support.createUiWindow({
+            id: 'tps',
+            title: 'LiveTranslatorTpsMonitor',
+            file: 'tps-monitor/index.html',
+            width: 520,
+            height: 560,
+            errorPrefix: '[LiveTranslatorTpsMonitor]',
+            closeWithGame: true,
+            defaultOpen: true,
+            query: { closeWithGame: '1' },
+            matchHotkey: (event) => {
+                const key = String(event.key || '').toLowerCase();
+                const code = String(event.code || '').toLowerCase();
+                return key === 't' || code === 'keyt';
+            },
+        }, windowContext),
     };
 
     function setTranslatorOpen(open) {
@@ -162,15 +178,26 @@
         url: windows.translator.url,
     };
 
+    globalThis.LiveTranslatorTpsMonitor = {
+        open: windows.tps.open,
+        close: windows.tps.close,
+        isOpen: windows.tps.isOpen,
+        url: windows.tps.url,
+    };
+
     globalThis.LiveTranslatorUiLauncher = {
         openPrecacher: windows.precacher.open,
         closePrecacher: windows.precacher.close,
         openTranslator: windows.translator.open,
         closeTranslator: windows.translator.close,
         isTranslatorOpen: windows.translator.isOpen,
+        openTpsMonitor: windows.tps.open,
+        closeTpsMonitor: windows.tps.close,
+        isTpsMonitorOpen: windows.tps.isOpen,
         urls: {
             precacher: windows.precacher.url,
             translator: windows.translator.url,
+            tps: windows.tps.url,
         },
     };
 

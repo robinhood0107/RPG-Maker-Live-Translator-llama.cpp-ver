@@ -48,5 +48,13 @@
         "enabled": true,
         "maxMegabytes": 2048,
         "clearOnLaunch": true
+    },
+    "metrics": {
+        "enabled": true,
+        "logFile": "translation-metrics.log",
+        "summaryFile": "translation-metrics-summary.json",
+        "analysisLogFile": "translation-tps-analysis.log",
+        "analysisSnapshotFile": "translation-tps-analysis.json",
+        "refreshMs": 1500
     }
 }

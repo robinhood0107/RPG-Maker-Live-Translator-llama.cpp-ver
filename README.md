@@ -183,6 +183,16 @@ Recommended `settings.json` fragment for English or other non-CJK source games:
 ## Translator GUI
 The translator monitor opens automatically when the game starts. If you close it, press `Ctrl+Shift+Enter` in the game window or run `LiveTranslatorGui.open()` from DevTools.
 
+## TPS Monitor / TPS 모니터
+
+KO: local LLM provider를 사용할 때 작은 TPS 모니터 창이 게임 시작 시 자동으로 열립니다. 닫은 뒤에는 게임 창에서 `Ctrl+Shift+T`를 누르거나 DevTools에서 `LiveTranslatorTpsMonitor.open()`을 실행해 다시 열 수 있습니다. 모니터는 모델별 generation TPS의 최신값, 평균, 1% low, 최소, 최대, P50, P95, 표준편차를 보여주며, server prompt TPS와 client-side completion/total TPS도 함께 집계합니다.
+
+EN: When the local LLM provider is active, a small TPS monitor window opens automatically with the game. If closed, press `Ctrl+Shift+T` in the game window or run `LiveTranslatorTpsMonitor.open()` from DevTools. The monitor shows latest, average, 1% low, min, max, P50, P95, and standard deviation for generation TPS per model, plus server prompt TPS and client-side completion/total TPS.
+
+KO: 원본 번역 텍스트는 로그에 저장하지 않습니다. 설치된 `live-translator/settings.json`의 `metrics` 섹션에서 파일명을 바꿀 수 있으며 기본 파일은 `translation-metrics.log`, `translation-metrics-summary.json`, `translation-tps-analysis.log`, `translation-tps-analysis.json`입니다.
+
+EN: Raw source/translated text is not written to the metrics logs. File names can be configured in the installed `live-translator/settings.json` `metrics` section. The default files are `translation-metrics.log`, `translation-metrics-summary.json`, `translation-tps-analysis.log`, and `translation-tps-analysis.json`.
+
 ## Precacher GUI (Beta)
 After installing the plugin, press `Ctrl+Shift+P` in the game window or run `LiveTranslatorPrecacher.open()` from DevTools.
 Extraction follows `settings.json` `translation.disableCjkFilter` and uses the same CJK gate as live translation.

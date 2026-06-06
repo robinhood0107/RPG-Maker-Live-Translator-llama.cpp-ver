@@ -21,6 +21,7 @@
             "config.js",
             "translator/providers/provider-utils.js",
             "translator/providers/local-protocol.js",
+            "translator/providers/local-metrics.js",
             "translator/providers/local-provider.js",
             "translator/providers/deepl-provider.js",
             "translator.js",
