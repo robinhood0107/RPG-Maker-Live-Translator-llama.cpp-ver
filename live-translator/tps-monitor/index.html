@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TPS Monitor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <main class="shell">
+        <header class="topbar">
+            <div>
+                <h1>TPS Monitor</h1>
+                <p id="status-line">Waiting for metrics...</p>
+            </div>
+            <button id="refresh-button" type="button" title="Refresh now">Refresh</button>
+        </header>
+
+        <section class="metric-grid" aria-label="Current TPS summary">
+            <div class="metric-card">
+                <span>Latest</span>
+                <strong id="latest-tps">-</strong>
+            </div>
+            <div class="metric-card">
+                <span>Average</span>
+                <strong id="average-tps">-</strong>
+            </div>
+            <div class="metric-card">
+                <span>1% Low</span>
+                <strong id="low1-tps">-</strong>
+            </div>
+            <div class="metric-card">
+                <span>Min / Max</span>
+                <strong id="minmax-tps">-</strong>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-title">
+                <h2>Generation TPS by Model</h2>
+                <span id="sample-count">0 samples</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Model</th>
+                            <th>N</th>
+                            <th>Latest</th>
+                            <th>Avg</th>
+                            <th>1% Low</th>
+                            <th>Min</th>
+                            <th>Max</th>
+                            <th>P50</th>
+                            <th>P95</th>
+                            <th>SD</th>
+                        </tr>
+                    </thead>
+                    <tbody id="model-rows">
+                        <tr><td colspan="10" class="empty">No TPS samples yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="panel compact-panel">
+            <div class="panel-title">
+                <h2>Detailed TPS</h2>
+                <span id="last-updated">-</span>
+            </div>
+            <div id="detail-grid" class="detail-grid"></div>
+        </section>
+
+        <footer>
+            <span id="log-path">-</span>
+            <span id="analysis-path">-</span>
+        </footer>
+    </main>
+    <script src="app.js"></script>
+</body>
+</html>

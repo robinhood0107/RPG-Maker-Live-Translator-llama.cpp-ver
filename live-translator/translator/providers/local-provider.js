@@ -31,6 +31,12 @@
 
     const utils = requireModule('runtime.translationProviderUtils');
     const protocol = requireModule('runtime.translationLocalProtocol');
+    let metricsModule = null;
+    try {
+        metricsModule = requireModule('runtime.translationLocalMetrics');
+    } catch (_) {
+        metricsModule = null;
+    }
     const {
         bindLogger,
         coerceFetchError,
@@ -62,9 +68,30 @@
         const cfg = normalizeLocalConfig(options.translatorConfig || getGlobalTranslatorConfig(), options.settings || getGlobalSettings());
         const fetchImpl = getFetch(options);
         const logger = bindLogger(options.logger);
+        let metricsRecorder = null;
+        if (metricsModule && typeof metricsModule.createLocalMetricsRecorder === 'function') {
+            try {
+                metricsRecorder = metricsModule.createLocalMetricsRecorder({
+                    logger: options.logger,
+                    settings: options.settings || getGlobalSettings(),
+                    paths: options.paths,
+                });
+            } catch (error) {
+                logger.warn('[LocalProvider] Metrics recorder could not be initialized.', error);
+            }
+        }
         let selectionCache = null;
         let selectionExpiresAt = 0;
         let selectionPromise = null;
+
+        function recordMetrics(payload) {
+            if (!metricsRecorder || typeof metricsRecorder.record !== 'function') return;
+            try {
+                metricsRecorder.record(payload);
+            } catch (error) {
+                logger.warn('[LocalProvider] Metrics recording failed.', error);
+            }
+        }
 
         async function requestLocalModelCatalog(requestOptions = {}) {
             const linked = createLinkedAbort({
@@ -125,6 +152,7 @@
             });
             const url = getLocalChatUrl(cfg);
             const requestBody = { ...body, model: selection.requestedModel };
+            const startedAt = Date.now();
             try {
                 const response = await fetchImpl(url, {
                     method: 'POST',
@@ -139,6 +167,22 @@
                 }
                 const data = await response.json();
                 assertLocalChatResponseMatchesSelection(data, selection);
+                let metricsOutputText = '';
+                try {
+                    metricsOutputText = extractMessageContentFromLocalResponse(data, selection);
+                } catch (_) {
+                    metricsOutputText = '';
+                }
+                recordMetrics({
+                    cfg,
+                    data,
+                    elapsedMs: Date.now() - startedAt,
+                    outputText: metricsOutputText,
+                    requestBody,
+                    selection,
+                    sourceText: requestOptions.text,
+                    stream: false,
+                });
                 return { data, selection };
             } catch (error) {
                 const converted = coerceFetchError(error, linked, 'Local LLM request failed');
@@ -161,6 +205,8 @@
             const requestBody = { ...body, model: selection.requestedModel };
             const onDelta = typeof requestOptions.onDelta === 'function' ? requestOptions.onDelta : null;
             let reader = null;
+            let finalData = null;
+            const startedAt = Date.now();
 
             try {
                 const response = await fetchImpl(url, {
@@ -198,6 +244,9 @@
                                 const error = new Error(String(message));
                                 try { error.retryable = true; } catch (_) {}
                                 throw error;
+                            }
+                            if (event.usage || event.timings || event.model || event.object === 'chat.completion') {
+                                finalData = event;
                             }
 
                             const cleaned = thinkStripper.feed(extractOpenAiStreamDeltaContent(event));
@@ -239,6 +288,7 @@
                             }
                         } else if (event.type === 'chat.end' && event.result) {
                             assertLocalChatResponseMatchesSelection(event.result, selection);
+                            finalData = event.result;
                             finalMessage = extractMessageContentFromV1(event.result);
                         } else if (event.type === 'error') {
                             const message = event.message || event.error || 'Local LLM stream error.';
@@ -249,6 +299,16 @@
                     }
                 }
 
+                recordMetrics({
+                    cfg,
+                    data: finalData || {},
+                    elapsedMs: Date.now() - startedAt,
+                    outputText: finalMessage || accumulatedMessage,
+                    requestBody,
+                    selection,
+                    sourceText: requestOptions.text,
+                    stream: true,
+                });
                 return { accumulatedMessage, finalMessage };
             } catch (error) {
                 const converted = coerceFetchError(error, linked, 'Local LLM stream request failed');
